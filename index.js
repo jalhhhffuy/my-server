@@ -8,6 +8,14 @@ app.get("/", (req, res) => {
   res.send("Server is working 🔥");
 });
 
+// فحص/إيقاظ السيرفر
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    message: "server awake"
+  });
+});
+
 // تسجيل زائر
 app.post("/guest", (req, res) => {
   const installId = req.body.installId;
@@ -21,14 +29,14 @@ app.post("/guest", (req, res) => {
 
   const playerId = "guest_" + installId;
 
-  res.json({
+  return res.json({
     success: true,
     playerId: playerId
   });
 });
 
+// تشغيل السيرفر
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
-  console.log("Server running...");
+  console.log(`Server running on port ${PORT}`);
 });
