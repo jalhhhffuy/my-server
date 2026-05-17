@@ -15,6 +15,10 @@ function getPlayFabConfig() {
 async function playFabPost(path, body) {
     const { titleId, secretKey } = getPlayFabConfig();
 
+    if (!titleId || !secretKey) {
+        return { code: 0, error: "PLAYFAB ENV MISSING" };
+    }
+
     const res = await fetch("https://" + titleId + ".playfabapi.com" + path, {
         method: "POST",
         headers: {
@@ -25,6 +29,35 @@ async function playFabPost(path, body) {
     });
 
     return await res.json();
+}
+
+async function getGoogleUser(code, redirectUri) {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body:
+            "code=" + encodeURIComponent(code) +
+            "&client_id=" + encodeURIComponent(clientId) +
+            "&client_secret=" + encodeURIComponent(clientSecret) +
+            "&redirect_uri=" + encodeURIComponent(redirectUri) +
+            "&grant_type=authorization_code"
+    });
+
+    const tokenData = await tokenRes.json();
+
+    if (!tokenData.access_token) {
+        console.log("TOKEN ERROR:", tokenData);
+        return null;
+    }
+
+    const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+        headers: { Authorization: "Bearer " + tokenData.access_token }
+    });
+
+    return await userRes.json();
 }
 
 app.get("/", (req, res) => {
@@ -63,7 +96,6 @@ app.get("/auth/google", (req, res) => {
     }
 
     const clientId = process.env.GOOGLE_CLIENT_ID;
-
     const redirectUri = SERVER_URL + "/auth/google/callback";
 
     const scope =
@@ -90,32 +122,12 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("فشل الربط: بيانات ناقصة");
         }
 
-        const clientId = process.env.GOOGLE_CLIENT_ID;
-        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
         const redirectUri = SERVER_URL + "/auth/google/callback";
+        const user = await getGoogleUser(code, redirectUri);
 
-        const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body:
-                "code=" + encodeURIComponent(code) +
-                "&client_id=" + encodeURIComponent(clientId) +
-                "&client_secret=" + encodeURIComponent(clientSecret) +
-                "&redirect_uri=" + encodeURIComponent(redirectUri) +
-                "&grant_type=authorization_code"
-        });
-
-        const tokenData = await tokenRes.json();
-
-        if (!tokenData.access_token) {
+        if (!user) {
             return res.send("فشل أخذ توكن Google");
         }
-
-        const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-            headers: { Authorization: "Bearer " + tokenData.access_token }
-        });
-
-        const user = await userRes.json();
 
         const email = String(user.email || "").trim().toLowerCase();
         const googleId = String(user.id || "").trim();
@@ -124,13 +136,16 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("فشل قراءة بيانات Google");
         }
 
-        const googleCustomId = "google_" + googleId;
         const googleIdMapKey = "google_id_map_" + googleId;
         const googleEmailMapKey = "google_email_map_" + email;
 
         const checkMap = await playFabPost("/Server/GetTitleInternalData", {
             Keys: [googleIdMapKey, googleEmailMapKey]
         });
+
+        if (checkMap.code !== 200) {
+            return res.send("فشل فحص الربط");
+        }
 
         const maps =
             checkMap.data && checkMap.data.Data
@@ -141,12 +156,11 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("هذا البريد مربوط مسبقاً بحساب");
         }
 
-        await playFabPost("/Server/UpdateUserData", {
+        const savePlayer = await playFabPost("/Server/UpdateUserData", {
             PlayFabId: playFabId,
             Data: {
                 google_email: email,
                 google_id: googleId,
-                google_custom_id: googleCustomId,
                 google_linked: "true",
                 account_email: email,
                 account_email_verified: "1",
@@ -155,11 +169,10 @@ app.get("/auth/google/callback", async (req, res) => {
             }
         });
 
-        await playFabPost("/Server/LinkServerCustomId", {
-            PlayFabId: playFabId,
-            ServerCustomId: googleCustomId,
-            ForceLink: true
-        });
+        if (savePlayer.code !== 200) {
+            console.log("SAVE PLAYER ERROR:", savePlayer);
+            return res.send("فشل حفظ الربط");
+        }
 
         await playFabPost("/Server/SetTitleInternalData", {
             Key: googleIdMapKey,
@@ -169,11 +182,6 @@ app.get("/auth/google/callback", async (req, res) => {
         await playFabPost("/Server/SetTitleInternalData", {
             Key: googleEmailMapKey,
             Value: playFabId
-        });
-
-        await playFabPost("/Server/SetTitleInternalData", {
-            Key: "google_custom_map_" + email,
-            Value: googleCustomId
         });
 
         return res.send(`
@@ -230,32 +238,12 @@ app.get("/auth/google/login/callback", async (req, res) => {
             return res.send("فشل تسجيل الدخول: بيانات ناقصة");
         }
 
-        const clientId = process.env.GOOGLE_CLIENT_ID;
-        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
         const redirectUri = SERVER_URL + "/auth/google/login/callback";
+        const user = await getGoogleUser(code, redirectUri);
 
-        const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            body:
-                "code=" + encodeURIComponent(code) +
-                "&client_id=" + encodeURIComponent(clientId) +
-                "&client_secret=" + encodeURIComponent(clientSecret) +
-                "&redirect_uri=" + encodeURIComponent(redirectUri) +
-                "&grant_type=authorization_code"
-        });
-
-        const tokenData = await tokenRes.json();
-
-        if (!tokenData.access_token) {
+        if (!user) {
             return res.send("فشل تسجيل Google");
         }
-
-        const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-            headers: { Authorization: "Bearer " + tokenData.access_token }
-        });
-
-        const user = await userRes.json();
 
         const email = String(user.email || "").trim().toLowerCase();
 
@@ -263,20 +251,24 @@ app.get("/auth/google/login/callback", async (req, res) => {
             return res.send("فشل قراءة البريد");
         }
 
-        const customMapKey = "google_custom_map_" + email;
+        const emailMapKey = "google_email_map_" + email;
 
         const mapResult = await playFabPost("/Server/GetTitleInternalData", {
-            Keys: [customMapKey]
+            Keys: [emailMapKey]
         });
+
+        if (mapResult.code !== 200) {
+            return res.send("فشل فحص الحساب");
+        }
 
         const maps =
             mapResult.data && mapResult.data.Data
                 ? mapResult.data.Data
                 : {};
 
-        const googleCustomId = maps[customMapKey];
+        const playFabId = maps[emailMapKey];
 
-        if (!googleCustomId) {
+        if (!playFabId) {
             await playFabPost("/Server/SetTitleInternalData", {
                 Key: "google_login_session_" + session,
                 Value: JSON.stringify({
@@ -297,12 +289,36 @@ app.get("/auth/google/login/callback", async (req, res) => {
             `);
         }
 
+        const customId = "login_google_" + session;
+
+        const linkResult = await playFabPost("/Server/LinkServerCustomId", {
+            PlayFabId: playFabId,
+            ServerCustomId: customId,
+            ForceLink: true
+        });
+
+        if (linkResult.code !== 200) {
+            console.log("LINK LOGIN CUSTOM ID ERROR:", linkResult);
+
+            await playFabPost("/Server/SetTitleInternalData", {
+                Key: "google_login_session_" + session,
+                Value: JSON.stringify({
+                    ok: false,
+                    message: "فشل تجهيز دخول Google",
+                    email: email
+                })
+            });
+
+            return res.send("فشل تجهيز دخول Google");
+        }
+
         await playFabPost("/Server/SetTitleInternalData", {
             Key: "google_login_session_" + session,
             Value: JSON.stringify({
                 ok: true,
                 email: email,
-                customId: googleCustomId
+                playFabId: playFabId,
+                customId: customId
             })
         });
 
