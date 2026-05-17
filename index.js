@@ -186,12 +186,40 @@ app.get("/auth/google/callback", async (req, res) => {
         res.send("حدث خطأ في السيرفر");
     }
 });
+app.get("/auth/google", (req, res) => {
+    const playFabId = String(req.query.playFabId || "").trim();
+
+    if (!playFabId) {
+        return res.send("playFabId مفقود");
+    }
+
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+
+    const redirectUri =
+        "https://my-server-i40i.onrender.com/auth/google/callback";
+
+    const scope =
+        "https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile";
+
+    const authUrl =
+        "https://accounts.google.com/o/oauth2/v2/auth" +
+        "?client_id=" + encodeURIComponent(clientId) +
+        "&redirect_uri=" + encodeURIComponent(redirectUri) +
+        "&response_type=code" +
+        "&scope=" + encodeURIComponent(scope) +
+        "&state=" + encodeURIComponent(playFabId) +
+        "&prompt=select_account";
+
+    console.log("GOOGLE LOGIN START:", playFabId);
+
+    return res.redirect(authUrl);
+});
+
 app.get("/auth/google/callback", async (req, res) => {
     try {
-
         console.log("GOOGLE CALLBACK HIT");
-        console.log(req.query);
-      
+        console.log("QUERY:", req.query);
+
         const code = req.query.code;
         const playFabId = req.query.state;
 
@@ -204,14 +232,22 @@ app.get("/auth/google/callback", async (req, res) => {
         const titleId = process.env.PLAYFAB_TITLE_ID;
         const secretKey = process.env.PLAYFAB_SECRET_KEY;
 
+        if (!clientId || !clientSecret || !titleId || !secretKey) {
+            console.log("MISSING ENV", {
+                clientId: !!clientId,
+                clientSecret: !!clientSecret,
+                titleId: !!titleId,
+                secretKey: !!secretKey
+            });
+            return res.send("إعدادات السيرفر ناقصة");
+        }
+
         const redirectUri =
             "https://my-server-i40i.onrender.com/auth/google/callback";
 
         const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body:
                 "code=" + encodeURIComponent(code) +
                 "&client_id=" + encodeURIComponent(clientId) +
@@ -223,26 +259,20 @@ app.get("/auth/google/callback", async (req, res) => {
         const tokenData = await tokenRes.json();
 
         if (!tokenData.access_token) {
-            console.log(tokenData);
+            console.log("TOKEN ERROR:", tokenData);
             return res.send("فشل أخذ توكن Google");
         }
 
-        const userRes = await fetch(
-            "https://www.googleapis.com/oauth2/v2/userinfo",
-            {
-                headers: {
-                    Authorization: "Bearer " + tokenData.access_token
-                }
-            }
-        );
+        const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+            headers: { Authorization: "Bearer " + tokenData.access_token }
+        });
 
         const user = await userRes.json();
 
-        const email = String(user.email || "")
-            .trim()
-            .toLowerCase();
-
+        const email = String(user.email || "").trim().toLowerCase();
         const googleId = String(user.id || "").trim();
+
+        console.log("GOOGLE USER:", { email: email, googleId: googleId });
 
         if (!email || !googleId) {
             return res.send("فشل قراءة بيانات Google");
@@ -251,7 +281,6 @@ app.get("/auth/google/callback", async (req, res) => {
         const googleIdMapKey = "google_id_map_" + googleId;
         const googleEmailMapKey = "google_email_map_" + email;
 
-        // نفحص التكرار
         const checkMapRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/GetTitleInternalData",
             {
@@ -267,43 +296,28 @@ app.get("/auth/google/callback", async (req, res) => {
         );
 
         const checkMapData = await checkMapRes.json();
+        console.log("CHECK MAP:", checkMapData);
 
         if (checkMapData.code !== 200) {
-            console.log(checkMapData);
-            return res.send("فشل فحص الحساب");
+            return res.send("فشل فحص الحساب من PlayFab");
         }
 
         const maps =
-            checkMapData.data &&
-            checkMapData.data.Data
+            checkMapData.data && checkMapData.data.Data
                 ? checkMapData.data.Data
                 : {};
 
-        const linkedByGoogleId =
-            maps[googleIdMapKey] || "";
+        const linkedByGoogleId = maps[googleIdMapKey] || "";
+        const linkedByEmail = maps[googleEmailMapKey] || "";
 
-        const linkedByEmail =
-            maps[googleEmailMapKey] || "";
-
-        if (
-            linkedByGoogleId &&
-            linkedByGoogleId !== playFabId
-        ) {
-            return res.send(
-                "هذا حساب Google مربوط بحساب آخر"
-            );
+        if (linkedByGoogleId && linkedByGoogleId !== playFabId) {
+            return res.send("هذا حساب Google مربوط بحساب آخر");
         }
 
-        if (
-            linkedByEmail &&
-            linkedByEmail !== playFabId
-        ) {
-            return res.send(
-                "هذا البريد مستخدم مسبقاً"
-            );
+        if (linkedByEmail && linkedByEmail !== playFabId) {
+            return res.send("هذا البريد مستخدم مسبقاً");
         }
 
-        // نحفظ بيانات اللاعب
         const savePlayerRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/UpdateUserData",
             {
@@ -327,18 +341,14 @@ app.get("/auth/google/callback", async (req, res) => {
             }
         );
 
-        const savePlayerData =
-            await savePlayerRes.json();
+        const savePlayerData = await savePlayerRes.json();
+        console.log("SAVE PLAYER:", savePlayerData);
 
         if (savePlayerData.code !== 200) {
-            console.log(savePlayerData);
-            return res.send(
-                "فشل حفظ الحساب"
-            );
+            return res.send("فشل حفظ الحساب في PlayFab");
         }
 
-        // نحفظ خريطة منع التكرار
-        await fetch(
+        const saveGoogleIdMapRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/SetTitleInternalData",
             {
                 method: "POST",
@@ -353,7 +363,10 @@ app.get("/auth/google/callback", async (req, res) => {
             }
         );
 
-        await fetch(
+        const saveGoogleIdMapData = await saveGoogleIdMapRes.json();
+        console.log("SAVE GOOGLE ID MAP:", saveGoogleIdMapData);
+
+        const saveEmailMapRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/SetTitleInternalData",
             {
                 method: "POST",
@@ -368,9 +381,16 @@ app.get("/auth/google/callback", async (req, res) => {
             }
         );
 
+        const saveEmailMapData = await saveEmailMapRes.json();
+        console.log("SAVE EMAIL MAP:", saveEmailMapData);
+
+        if (saveGoogleIdMapData.code !== 200 || saveEmailMapData.code !== 200) {
+            return res.send("تم حفظ البريد لكن فشل حفظ منع التكرار");
+        }
+
         return res.send(`
             <html>
-            <body style="font-family:sans-serif;text-align:center;padding-top:60px;">
+            <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
                 <h2>تم ربط حساب Google بنجاح ✅</h2>
                 <p>ارجع إلى اللعبة</p>
             </body>
@@ -378,15 +398,7 @@ app.get("/auth/google/callback", async (req, res) => {
         `);
 
     } catch (e) {
-        console.log(e);
-
-        return res.send(`
-            <html>
-            <body style="font-family:sans-serif;text-align:center;padding-top:60px;">
-                <h2>حدث خطأ ❌</h2>
-                <p>تحقق من إعدادات السيرفر</p>
-            </body>
-            </html>
-        `);
+        console.log("CALLBACK ERROR:", e);
+        return res.send("حدث خطأ في السيرفر");
     }
 });
