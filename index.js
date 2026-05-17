@@ -188,6 +188,10 @@ app.get("/auth/google/callback", async (req, res) => {
 });
 app.get("/auth/google/callback", async (req, res) => {
     try {
+
+        console.log("GOOGLE CALLBACK HIT");
+        console.log(req.query);
+      
         const code = req.query.code;
         const playFabId = req.query.state;
 
