@@ -37,7 +37,9 @@ async function getGoogleUser(code, redirectUri) {
 
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
         body:
             "code=" + encodeURIComponent(code) +
             "&client_id=" + encodeURIComponent(clientId) +
@@ -54,7 +56,9 @@ async function getGoogleUser(code, redirectUri) {
     }
 
     const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-        headers: { Authorization: "Bearer " + tokenData.access_token }
+        headers: {
+            Authorization: "Bearer " + tokenData.access_token
+        }
     });
 
     return await userRes.json();
@@ -65,7 +69,10 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-    res.json({ ok: true, message: "server awake" });
+    res.json({
+        ok: true,
+        message: "server awake"
+    });
 });
 
 app.post("/guest", (req, res) => {
@@ -96,6 +103,11 @@ app.get("/auth/google", (req, res) => {
     }
 
     const clientId = process.env.GOOGLE_CLIENT_ID;
+
+    if (!clientId) {
+        return res.send("GOOGLE_CLIENT_ID ناقص");
+    }
+
     const redirectUri = SERVER_URL + "/auth/google/callback";
 
     const scope =
@@ -212,6 +224,11 @@ app.get("/auth/google/login", (req, res) => {
     }
 
     const clientId = process.env.GOOGLE_CLIENT_ID;
+
+    if (!clientId) {
+        return res.send("GOOGLE_CLIENT_ID ناقص");
+    }
+
     const redirectUri = SERVER_URL + "/auth/google/login/callback";
 
     const scope =
@@ -324,10 +341,18 @@ app.get("/auth/google/login/callback", async (req, res) => {
 
         return res.send(`
             <html>
+            <head>
+                <meta charset="UTF-8">
+                <script>
+                    setTimeout(function () {
+                        window.location.href = "unitydl://google-login-success";
+                    }, 1500);
+                </script>
+            </head>
             <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
                 <h2>تم تسجيل الدخول بنجاح ✅</h2>
                 <p>${email}</p>
-                <p>ارجع إلى اللعبة</p>
+                <p>جاري الرجوع إلى اللعبة...</p>
             </body>
             </html>
         `);
