@@ -18,10 +18,7 @@ async function playFabPost(path, body) {
     const { titleId, secretKey } = getPlayFabConfig();
 
     if (!titleId || !secretKey) {
-        return {
-            code: 0,
-            error: "PLAYFAB ENV MISSING"
-        };
+        return { code: 0, error: "PLAYFAB ENV MISSING" };
     }
 
     const res = await fetch("https://" + titleId + ".playfabapi.com" + path, {
@@ -38,10 +35,15 @@ async function playFabPost(path, body) {
 
 function makeEmailTransporter() {
     return nodemailer.createTransport({
-        service: "gmail",
+        host: "smtp.office365.com",
+        port: 587,
+        secure: false,
         auth: {
             user: process.env.EMAIL_USER,
             pass: process.env.EMAIL_PASS
+        },
+        tls: {
+            ciphers: "SSLv3"
         }
     });
 }
@@ -129,9 +131,7 @@ app.get("/auth/google/callback", async (req, res) => {
 
         const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body:
                 "code=" + encodeURIComponent(code) +
                 "&client_id=" + encodeURIComponent(clientId) +
@@ -148,9 +148,7 @@ app.get("/auth/google/callback", async (req, res) => {
         }
 
         const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-            headers: {
-                Authorization: "Bearer " + tokenData.access_token
-            }
+            headers: { Authorization: "Bearer " + tokenData.access_token }
         });
 
         const user = await userRes.json();
