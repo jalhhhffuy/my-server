@@ -3,7 +3,6 @@ const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 
 const app = express();
-
 app.use(express.json());
 
 const SERVER_URL = "https://my-server-i40i.onrender.com";
@@ -15,14 +14,17 @@ function getPlayFabConfig() {
     };
 }
 
-function playFabUrl(titleId, path) {
-    return "https://" + titleId + ".playfabapi.com" + path;
-}
-
 async function playFabPost(path, body) {
     const { titleId, secretKey } = getPlayFabConfig();
 
-    const res = await fetch(playFabUrl(titleId, path), {
+    if (!titleId || !secretKey) {
+        return {
+            code: 0,
+            error: "PLAYFAB ENV MISSING"
+        };
+    }
+
+    const res = await fetch("https://" + titleId + ".playfabapi.com" + path, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -71,13 +73,8 @@ app.post("/guest", (req, res) => {
     });
 });
 
-app.get("/test-google-log", (req, res) => {
-    console.log("TEST GOOGLE LOG WORKING");
-    res.send("test ok");
-});
-
 // ===============================
-// تسجيل Google
+// Google Login
 // ===============================
 
 app.get("/auth/google", (req, res) => {
@@ -90,7 +87,7 @@ app.get("/auth/google", (req, res) => {
     const clientId = process.env.GOOGLE_CLIENT_ID;
 
     if (!clientId) {
-        return res.send("GOOGLE_CLIENT_ID ناقص في Render");
+        return res.send("GOOGLE_CLIENT_ID ناقص");
     }
 
     const redirectUri = SERVER_URL + "/auth/google/callback";
@@ -114,9 +111,6 @@ app.get("/auth/google", (req, res) => {
 
 app.get("/auth/google/callback", async (req, res) => {
     try {
-        console.log("GOOGLE CALLBACK HIT");
-        console.log("QUERY:", req.query);
-
         const code = req.query.code;
         const playFabId = String(req.query.state || "").trim();
 
@@ -126,11 +120,9 @@ app.get("/auth/google/callback", async (req, res) => {
 
         const clientId = process.env.GOOGLE_CLIENT_ID;
         const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-        const titleId = process.env.PLAYFAB_TITLE_ID;
-        const secretKey = process.env.PLAYFAB_SECRET_KEY;
 
-        if (!clientId || !clientSecret || !titleId || !secretKey) {
-            return res.send("إعدادات السيرفر ناقصة");
+        if (!clientId || !clientSecret) {
+            return res.send("إعدادات Google ناقصة");
         }
 
         const redirectUri = SERVER_URL + "/auth/google/callback";
@@ -151,7 +143,7 @@ app.get("/auth/google/callback", async (req, res) => {
         const tokenData = await tokenRes.json();
 
         if (!tokenData.access_token) {
-            console.log("TOKEN ERROR:", JSON.stringify(tokenData));
+            console.log("TOKEN ERROR:", tokenData);
             return res.send("فشل أخذ توكن Google");
         }
 
@@ -186,6 +178,7 @@ app.get("/auth/google/callback", async (req, res) => {
         });
 
         if (playerData.code !== 200) {
+            console.log("PLAYER DATA ERROR:", playerData);
             return res.send("فشل فحص بيانات اللاعب");
         }
 
@@ -212,7 +205,8 @@ app.get("/auth/google/callback", async (req, res) => {
         });
 
         if (checkMapData.code !== 200) {
-            return res.send("فشل فحص الحساب من PlayFab");
+            console.log("CHECK MAP ERROR:", checkMapData);
+            return res.send("فشل فحص منع التكرار");
         }
 
         const maps =
@@ -242,6 +236,7 @@ app.get("/auth/google/callback", async (req, res) => {
         });
 
         if (savePlayerData.code !== 200) {
+            console.log("SAVE PLAYER ERROR:", savePlayerData);
             return res.send("فشل حفظ الحساب في PlayFab");
         }
 
@@ -276,7 +271,7 @@ app.get("/auth/google/callback", async (req, res) => {
 });
 
 // ===============================
-// طلب إلغاء ربط Google
+// طلب إلغاء الربط
 // ===============================
 
 app.get("/auth/google/unlink/request", async (req, res) => {
@@ -285,6 +280,10 @@ app.get("/auth/google/unlink/request", async (req, res) => {
 
         if (!playFabId) {
             return res.send("playFabId مفقود");
+        }
+
+        if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+            return res.send("إعدادات البريد ناقصة في Render");
         }
 
         const playerData = await playFabPost("/Server/GetUserData", {
@@ -298,6 +297,7 @@ app.get("/auth/google/unlink/request", async (req, res) => {
         });
 
         if (playerData.code !== 200) {
+            console.log("UNLINK PLAYER DATA ERROR:", playerData);
             return res.send("فشل قراءة بيانات اللاعب");
         }
 
@@ -326,7 +326,6 @@ app.get("/auth/google/unlink/request", async (req, res) => {
 
         const token = crypto.randomBytes(32).toString("hex");
         const expiresAt = Date.now() + 15 * 60 * 1000;
-
         const tokenKey = "unlink_google_token_" + token;
 
         const saveToken = await playFabPost("/Server/SetTitleInternalData", {
@@ -341,6 +340,7 @@ app.get("/auth/google/unlink/request", async (req, res) => {
         });
 
         if (saveToken.code !== 200) {
+            console.log("SAVE TOKEN ERROR:", saveToken);
             return res.send("فشل إنشاء رابط الإلغاء");
         }
 
@@ -357,7 +357,11 @@ app.get("/auth/google/unlink/request", async (req, res) => {
                 <div style="font-family:Arial;text-align:right;direction:rtl;">
                     <h2>تأكيد إلغاء ربط حساب Google</h2>
                     <p>إذا كنت تريد إلغاء ربط هذا البريد من حساب اللعبة اضغط الرابط:</p>
-                    <p><a href="${confirmUrl}">إلغاء الربط</a></p>
+                    <p>
+                        <a href="${confirmUrl}" style="font-size:18px;">
+                            إلغاء الربط
+                        </a>
+                    </p>
                     <p>الرابط صالح لمدة 15 دقيقة فقط.</p>
                     <p>إذا لم تطلب هذا الإجراء تجاهل الرسالة.</p>
                 </div>
@@ -373,7 +377,7 @@ app.get("/auth/google/unlink/request", async (req, res) => {
 });
 
 // ===============================
-// تأكيد إلغاء ربط Google
+// تأكيد إلغاء الربط
 // ===============================
 
 app.get("/auth/google/unlink/confirm", async (req, res) => {
@@ -446,6 +450,7 @@ app.get("/auth/google/unlink/confirm", async (req, res) => {
         });
 
         if (removePlayerData.code !== 200) {
+            console.log("REMOVE PLAYER ERROR:", removePlayerData);
             return res.send("فشل حذف بيانات الربط من اللاعب");
         }
 
