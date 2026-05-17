@@ -247,7 +247,9 @@ app.get("/auth/google/callback", async (req, res) => {
 
         const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
             method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
             body:
                 "code=" + encodeURIComponent(code) +
                 "&client_id=" + encodeURIComponent(clientId) +
@@ -263,16 +265,21 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("فشل أخذ توكن Google");
         }
 
-        const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-            headers: { Authorization: "Bearer " + tokenData.access_token }
-        });
+        const userRes = await fetch(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            {
+                headers: {
+                    Authorization: "Bearer " + tokenData.access_token
+                }
+            }
+        );
 
         const user = await userRes.json();
 
         const email = String(user.email || "").trim().toLowerCase();
         const googleId = String(user.id || "").trim();
 
-        console.log("GOOGLE USER:", { email: email, googleId: googleId });
+        console.log("GOOGLE USER:", { email, googleId });
 
         if (!email || !googleId) {
             return res.send("فشل قراءة بيانات Google");
@@ -281,6 +288,55 @@ app.get("/auth/google/callback", async (req, res) => {
         const googleIdMapKey = "google_id_map_" + googleId;
         const googleEmailMapKey = "google_email_map_" + email;
 
+        // نفحص هل نفس اللاعب عنده حساب مربوط مسبقاً
+        const playerDataRes = await fetch(
+            "https://" + titleId + ".playfabapi.com/Server/GetUserData",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-SecretKey": secretKey
+                },
+                body: JSON.stringify({
+                    PlayFabId: playFabId,
+                    Keys: [
+                        "google_linked",
+                        "google_email",
+                        "account_email",
+                        "account_status"
+                    ]
+                })
+            }
+        );
+
+        const playerData = await playerDataRes.json();
+        console.log("PLAYER DATA:", playerData);
+
+        if (playerData.code !== 200) {
+            return res.send("فشل فحص بيانات اللاعب");
+        }
+
+        const userData =
+            playerData.data && playerData.data.Data
+                ? playerData.data.Data
+                : {};
+
+        const alreadyLinked =
+            userData.google_linked &&
+            userData.google_linked.Value === "true";
+
+        const oldEmail =
+            userData.account_email && userData.account_email.Value
+                ? String(userData.account_email.Value).trim().toLowerCase()
+                : "";
+
+        if (alreadyLinked || oldEmail) {
+            return res.send(
+                "هذا الحساب مربوط مسبقاً ببريد: " + oldEmail
+            );
+        }
+
+        // نفحص منع التكرار من TitleInternalData
         const checkMapRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/GetTitleInternalData",
             {
@@ -310,14 +366,16 @@ app.get("/auth/google/callback", async (req, res) => {
         const linkedByGoogleId = maps[googleIdMapKey] || "";
         const linkedByEmail = maps[googleEmailMapKey] || "";
 
-        if (linkedByGoogleId && linkedByGoogleId !== playFabId) {
-            return res.send("هذا حساب Google مربوط بحساب آخر");
+        // هنا يمنع التسجيل مرة ثانية حتى لو نفس اللاعب
+        if (linkedByGoogleId) {
+            return res.send("هذا حساب Google مستخدم مسبقاً");
         }
 
-        if (linkedByEmail && linkedByEmail !== playFabId) {
+        if (linkedByEmail) {
             return res.send("هذا البريد مستخدم مسبقاً");
         }
 
+        // حفظ بيانات اللاعب
         const savePlayerRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/UpdateUserData",
             {
@@ -348,6 +406,7 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("فشل حفظ الحساب في PlayFab");
         }
 
+        // حفظ خريطة Google ID
         const saveGoogleIdMapRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/SetTitleInternalData",
             {
@@ -366,6 +425,7 @@ app.get("/auth/google/callback", async (req, res) => {
         const saveGoogleIdMapData = await saveGoogleIdMapRes.json();
         console.log("SAVE GOOGLE ID MAP:", saveGoogleIdMapData);
 
+        // حفظ خريطة البريد
         const saveEmailMapRes = await fetch(
             "https://" + titleId + ".playfabapi.com/Server/SetTitleInternalData",
             {
@@ -392,6 +452,7 @@ app.get("/auth/google/callback", async (req, res) => {
             <html>
             <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
                 <h2>تم ربط حساب Google بنجاح ✅</h2>
+                <p>${email}</p>
                 <p>ارجع إلى اللعبة</p>
             </body>
             </html>
