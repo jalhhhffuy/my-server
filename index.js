@@ -186,3 +186,203 @@ app.get("/auth/google/callback", async (req, res) => {
         res.send("حدث خطأ في السيرفر");
     }
 });
+app.get("/auth/google/callback", async (req, res) => {
+    try {
+        const code = req.query.code;
+        const playFabId = req.query.state;
+
+        if (!code || !playFabId) {
+            return res.send("فشل تسجيل الدخول: بيانات ناقصة");
+        }
+
+        const clientId = process.env.GOOGLE_CLIENT_ID;
+        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+        const titleId = process.env.PLAYFAB_TITLE_ID;
+        const secretKey = process.env.PLAYFAB_SECRET_KEY;
+
+        const redirectUri =
+            "https://my-server-i40i.onrender.com/auth/google/callback";
+
+        const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body:
+                "code=" + encodeURIComponent(code) +
+                "&client_id=" + encodeURIComponent(clientId) +
+                "&client_secret=" + encodeURIComponent(clientSecret) +
+                "&redirect_uri=" + encodeURIComponent(redirectUri) +
+                "&grant_type=authorization_code"
+        });
+
+        const tokenData = await tokenRes.json();
+
+        if (!tokenData.access_token) {
+            console.log(tokenData);
+            return res.send("فشل أخذ توكن Google");
+        }
+
+        const userRes = await fetch(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            {
+                headers: {
+                    Authorization: "Bearer " + tokenData.access_token
+                }
+            }
+        );
+
+        const user = await userRes.json();
+
+        const email = String(user.email || "")
+            .trim()
+            .toLowerCase();
+
+        const googleId = String(user.id || "").trim();
+
+        if (!email || !googleId) {
+            return res.send("فشل قراءة بيانات Google");
+        }
+
+        const googleIdMapKey = "google_id_map_" + googleId;
+        const googleEmailMapKey = "google_email_map_" + email;
+
+        // نفحص التكرار
+        const checkMapRes = await fetch(
+            "https://" + titleId + ".playfabapi.com/Server/GetTitleInternalData",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-SecretKey": secretKey
+                },
+                body: JSON.stringify({
+                    Keys: [googleIdMapKey, googleEmailMapKey]
+                })
+            }
+        );
+
+        const checkMapData = await checkMapRes.json();
+
+        if (checkMapData.code !== 200) {
+            console.log(checkMapData);
+            return res.send("فشل فحص الحساب");
+        }
+
+        const maps =
+            checkMapData.data &&
+            checkMapData.data.Data
+                ? checkMapData.data.Data
+                : {};
+
+        const linkedByGoogleId =
+            maps[googleIdMapKey] || "";
+
+        const linkedByEmail =
+            maps[googleEmailMapKey] || "";
+
+        if (
+            linkedByGoogleId &&
+            linkedByGoogleId !== playFabId
+        ) {
+            return res.send(
+                "هذا حساب Google مربوط بحساب آخر"
+            );
+        }
+
+        if (
+            linkedByEmail &&
+            linkedByEmail !== playFabId
+        ) {
+            return res.send(
+                "هذا البريد مستخدم مسبقاً"
+            );
+        }
+
+        // نحفظ بيانات اللاعب
+        const savePlayerRes = await fetch(
+            "https://" + titleId + ".playfabapi.com/Server/UpdateUserData",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-SecretKey": secretKey
+                },
+                body: JSON.stringify({
+                    PlayFabId: playFabId,
+                    Data: {
+                        google_email: email,
+                        google_id: googleId,
+                        google_linked: "true",
+                        account_email: email,
+                        account_email_verified: "1",
+                        account_status: "official",
+                        login_provider: "google"
+                    }
+                })
+            }
+        );
+
+        const savePlayerData =
+            await savePlayerRes.json();
+
+        if (savePlayerData.code !== 200) {
+            console.log(savePlayerData);
+            return res.send(
+                "فشل حفظ الحساب"
+            );
+        }
+
+        // نحفظ خريطة منع التكرار
+        await fetch(
+            "https://" + titleId + ".playfabapi.com/Server/SetTitleInternalData",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-SecretKey": secretKey
+                },
+                body: JSON.stringify({
+                    Key: googleIdMapKey,
+                    Value: playFabId
+                })
+            }
+        );
+
+        await fetch(
+            "https://" + titleId + ".playfabapi.com/Server/SetTitleInternalData",
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-SecretKey": secretKey
+                },
+                body: JSON.stringify({
+                    Key: googleEmailMapKey,
+                    Value: playFabId
+                })
+            }
+        );
+
+        return res.send(`
+            <html>
+            <body style="font-family:sans-serif;text-align:center;padding-top:60px;">
+                <h2>تم ربط حساب Google بنجاح ✅</h2>
+                <p>ارجع إلى اللعبة</p>
+            </body>
+            </html>
+        `);
+
+    } catch (e) {
+        console.log(e);
+
+        return res.send(`
+            <html>
+            <body style="font-family:sans-serif;text-align:center;padding-top:60px;">
+                <h2>حدث خطأ ❌</h2>
+                <p>تحقق من إعدادات السيرفر</p>
+            </body>
+            </html>
+        `);
+    }
+});
