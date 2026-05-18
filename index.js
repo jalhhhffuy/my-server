@@ -34,22 +34,13 @@ async function playFabPost(path, body) {
     const text = await res.text();
 
     if (!text) {
-        return {
-            code: res.status,
-            error: "EMPTY_PLAYFAB_RESPONSE",
-            url: url
-        };
+        return { code: res.status, error: "EMPTY_PLAYFAB_RESPONSE", url: url };
     }
 
     try {
         return JSON.parse(text);
-    } catch (e) {
-        return {
-            code: res.status,
-            error: "INVALID_JSON_FROM_PLAYFAB",
-            raw: text,
-            url: url
-        };
+    } catch {
+        return { code: res.status, error: "INVALID_JSON_FROM_PLAYFAB", raw: text, url: url };
     }
 }
 
@@ -198,18 +189,6 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("فشل حفظ الربط");
         }
 
-        const linkCustom = await playFabPost("/Server/LinkCustomID", {
-            PlayFabId: playFabId,
-            CustomId: googleCustomId,
-            ForceLink: true
-        });
-
-        console.log("LINK GOOGLE CUSTOM ID:", JSON.stringify(linkCustom));
-
-        if (linkCustom.code !== 200) {
-            return res.send("فشل ربط Google بالدخول: " + JSON.stringify(linkCustom));
-        }
-
         await playFabPost("/Server/SetTitleInternalData", {
             Key: googleIdMapKey,
             Value: playFabId
@@ -283,11 +262,9 @@ app.get("/auth/google/login/callback", async (req, res) => {
         if (!user) return res.send("فشل تسجيل Google");
 
         const email = String(user.email || "").trim().toLowerCase();
-        const googleId = String(user.id || "").trim();
 
-        if (!email || !googleId) return res.send("فشل قراءة بيانات Google");
+        if (!email) return res.send("فشل قراءة البريد");
 
-        const googleCustomId = "google_" + googleId;
         const emailMapKey = "google_email_map_" + email;
         const customMapKey = "google_custom_map_" + email;
 
@@ -301,8 +278,9 @@ app.get("/auth/google/login/callback", async (req, res) => {
                 : {};
 
         const playFabId = maps[emailMapKey];
+        const googleCustomId = maps[customMapKey];
 
-        if (!playFabId) {
+        if (!playFabId || !googleCustomId) {
             await playFabPost("/Server/SetTitleInternalData", {
                 Key: "google_login_session_" + session,
                 Value: JSON.stringify({
@@ -322,32 +300,6 @@ app.get("/auth/google/login/callback", async (req, res) => {
                 </html>
             `);
         }
-
-        const linkResult = await playFabPost("/Server/LinkCustomID", {
-            PlayFabId: playFabId,
-            CustomId: googleCustomId,
-            ForceLink: true
-        });
-
-        console.log("LOGIN LINK RESULT:", JSON.stringify(linkResult));
-
-        if (linkResult.code !== 200) {
-            await playFabPost("/Server/SetTitleInternalData", {
-                Key: "google_login_session_" + session,
-                Value: JSON.stringify({
-                    ok: false,
-                    message: "فشل ربط دخول Google",
-                    email: email
-                })
-            });
-
-            return res.send("فشل ربط دخول Google: " + JSON.stringify(linkResult));
-        }
-
-        await playFabPost("/Server/SetTitleInternalData", {
-            Key: customMapKey,
-            Value: googleCustomId
-        });
 
         await playFabPost("/Server/SetTitleInternalData", {
             Key: "google_login_session_" + session,
