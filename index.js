@@ -4,6 +4,7 @@ const app = express();
 app.use(express.json());
 
 const SERVER_URL = "https://my-server-i40i.onrender.com";
+const GAME_DEEP_LINK = "pirateclash://google-login-success";
 
 function getPlayFabConfig() {
     return {
@@ -34,6 +35,11 @@ async function playFabPost(path, body) {
 async function getGoogleUser(code, redirectUri) {
     const clientId = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+    if (!clientId || !clientSecret) {
+        console.log("GOOGLE ENV MISSING");
+        return null;
+    }
 
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
         method: "POST",
@@ -345,7 +351,7 @@ app.get("/auth/google/login/callback", async (req, res) => {
                 <meta charset="UTF-8">
                 <script>
                     setTimeout(function () {
-                        window.location.href = "unitydl://google-login-success";
+                        window.location.href = "${GAME_DEEP_LINK}";
                     }, 1500);
                 </script>
             </head>
