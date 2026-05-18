@@ -34,13 +34,13 @@ async function playFabPost(path, body) {
     const text = await res.text();
 
     if (!text) {
-        return { code: res.status, error: "EMPTY_PLAYFAB_RESPONSE", url: url };
+        return { code: res.status, error: "EMPTY_PLAYFAB_RESPONSE", url };
     }
 
     try {
         return JSON.parse(text);
     } catch {
-        return { code: res.status, error: "INVALID_JSON_FROM_PLAYFAB", raw: text, url: url };
+        return { code: res.status, error: "INVALID_JSON_FROM_PLAYFAB", raw: text, url };
     }
 }
 
@@ -162,10 +162,7 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("فشل فحص الربط: " + JSON.stringify(checkMap));
         }
 
-        const maps =
-            checkMap.data && checkMap.data.Data
-                ? checkMap.data.Data
-                : {};
+        const maps = checkMap.data && checkMap.data.Data ? checkMap.data.Data : {};
 
         if (maps[googleIdMapKey] && maps[googleIdMapKey] !== playFabId) {
             return res.send("هذا Google مربوط بحساب آخر");
@@ -189,8 +186,15 @@ app.get("/auth/google/callback", async (req, res) => {
             }
         });
 
+        console.log("SAVE GOOGLE USERDATA:", JSON.stringify({
+            playFabId,
+            email,
+            googleId,
+            googleCustomId,
+            result: savePlayer
+        }));
+
         if (savePlayer.code !== 200) {
-            console.log("SAVE PLAYER ERROR:", JSON.stringify(savePlayer));
             return res.send("فشل حفظ الربط: " + JSON.stringify(savePlayer));
         }
 
@@ -219,7 +223,7 @@ app.get("/auth/google/callback", async (req, res) => {
             <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
                 <h2>تم ربط Google بنجاح ✅</h2>
                 <p>${email}</p>
-                <p>ارجع إلى اللعبة وافتح الحساب مرة ثانية لتثبيت الربط</p>
+                <p>ارجع إلى اللعبة وافتح الحساب مرة ثانية</p>
             </body>
             </html>
         `);
@@ -289,24 +293,12 @@ app.get("/auth/google/login/callback", async (req, res) => {
             return res.send("فشل فحص الحساب: " + JSON.stringify(mapResult));
         }
 
-        const maps =
-            mapResult.data && mapResult.data.Data
-                ? mapResult.data.Data
-                : {};
+        const maps = mapResult.data && mapResult.data.Data ? mapResult.data.Data : {};
 
         const playFabId = maps[emailMapKey];
-        let savedCustomId = maps[customMapKey];
+        const savedCustomId = maps[customMapKey] || googleCustomId;
 
-        if (!savedCustomId) {
-            savedCustomId = googleCustomId;
-
-            await playFabPost("/Server/SetTitleInternalData", {
-                Key: customMapKey,
-                Value: savedCustomId
-            });
-        }
-
-        if (!playFabId || !savedCustomId) {
+        if (!playFabId) {
             await playFabPost("/Server/SetTitleInternalData", {
                 Key: "google_login_session_" + session,
                 Value: JSON.stringify({
@@ -326,6 +318,11 @@ app.get("/auth/google/login/callback", async (req, res) => {
                 </html>
             `);
         }
+
+        await playFabPost("/Server/SetTitleInternalData", {
+            Key: customMapKey,
+            Value: savedCustomId
+        });
 
         await playFabPost("/Server/SetTitleInternalData", {
             Key: "google_login_session_" + session,
