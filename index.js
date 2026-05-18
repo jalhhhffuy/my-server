@@ -36,16 +36,11 @@ async function getGoogleUser(code, redirectUri) {
     const clientId = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
-    if (!clientId || !clientSecret) {
-        console.log("GOOGLE ENV MISSING");
-        return null;
-    }
+    if (!clientId || !clientSecret) return null;
 
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
         method: "POST",
-        headers: {
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body:
             "code=" + encodeURIComponent(code) +
             "&client_id=" + encodeURIComponent(clientId) +
@@ -62,9 +57,7 @@ async function getGoogleUser(code, redirectUri) {
     }
 
     const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-        headers: {
-            Authorization: "Bearer " + tokenData.access_token
-        }
+        headers: { Authorization: "Bearer " + tokenData.access_token }
     });
 
     return await userRes.json();
@@ -75,10 +68,7 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-    res.json({
-        ok: true,
-        message: "server awake"
-    });
+    res.json({ ok: true, message: "server awake" });
 });
 
 app.post("/guest", (req, res) => {
@@ -104,15 +94,10 @@ app.post("/guest", (req, res) => {
 app.get("/auth/google", (req, res) => {
     const playFabId = String(req.query.playFabId || "").trim();
 
-    if (!playFabId) {
-        return res.send("playFabId مفقود");
-    }
+    if (!playFabId) return res.send("playFabId مفقود");
 
     const clientId = process.env.GOOGLE_CLIENT_ID;
-
-    if (!clientId) {
-        return res.send("GOOGLE_CLIENT_ID ناقص");
-    }
+    if (!clientId) return res.send("GOOGLE_CLIENT_ID ناقص");
 
     const redirectUri = SERVER_URL + "/auth/google/callback";
 
@@ -136,23 +121,17 @@ app.get("/auth/google/callback", async (req, res) => {
         const code = req.query.code;
         const playFabId = String(req.query.state || "").trim();
 
-        if (!code || !playFabId) {
-            return res.send("فشل الربط: بيانات ناقصة");
-        }
+        if (!code || !playFabId) return res.send("فشل الربط: بيانات ناقصة");
 
         const redirectUri = SERVER_URL + "/auth/google/callback";
         const user = await getGoogleUser(code, redirectUri);
 
-        if (!user) {
-            return res.send("فشل أخذ توكن Google");
-        }
+        if (!user) return res.send("فشل أخذ توكن Google");
 
         const email = String(user.email || "").trim().toLowerCase();
         const googleId = String(user.id || "").trim();
 
-        if (!email || !googleId) {
-            return res.send("فشل قراءة بيانات Google");
-        }
+        if (!email || !googleId) return res.send("فشل قراءة بيانات Google");
 
         const googleCustomId = "google_" + googleId;
         const googleIdMapKey = "google_id_map_" + googleId;
@@ -162,10 +141,6 @@ app.get("/auth/google/callback", async (req, res) => {
         const checkMap = await playFabPost("/Server/GetTitleInternalData", {
             Keys: [googleIdMapKey, googleEmailMapKey]
         });
-
-        if (checkMap.code !== 200) {
-            return res.send("فشل فحص الربط");
-        }
 
         const maps =
             checkMap.data && checkMap.data.Data
@@ -205,8 +180,9 @@ app.get("/auth/google/callback", async (req, res) => {
             ForceLink: true
         });
 
+        console.log("LINK GOOGLE CUSTOM ID:", JSON.stringify(linkCustom));
+
         if (linkCustom.code !== 200) {
-            console.log("LINK GOOGLE CUSTOM ID ERROR:", linkCustom);
             return res.send("فشل ربط Google بالدخول");
         }
 
@@ -248,15 +224,10 @@ app.get("/auth/google/callback", async (req, res) => {
 app.get("/auth/google/login", (req, res) => {
     const session = String(req.query.session || "").trim();
 
-    if (!session) {
-        return res.send("session مفقود");
-    }
+    if (!session) return res.send("session مفقود");
 
     const clientId = process.env.GOOGLE_CLIENT_ID;
-
-    if (!clientId) {
-        return res.send("GOOGLE_CLIENT_ID ناقص");
-    }
+    if (!clientId) return res.send("GOOGLE_CLIENT_ID ناقص");
 
     const redirectUri = SERVER_URL + "/auth/google/login/callback";
 
@@ -280,23 +251,17 @@ app.get("/auth/google/login/callback", async (req, res) => {
         const code = req.query.code;
         const session = String(req.query.state || "").trim();
 
-        if (!code || !session) {
-            return res.send("فشل تسجيل الدخول: بيانات ناقصة");
-        }
+        if (!code || !session) return res.send("فشل تسجيل الدخول: بيانات ناقصة");
 
         const redirectUri = SERVER_URL + "/auth/google/login/callback";
         const user = await getGoogleUser(code, redirectUri);
 
-        if (!user) {
-            return res.send("فشل تسجيل Google");
-        }
+        if (!user) return res.send("فشل تسجيل Google");
 
         const email = String(user.email || "").trim().toLowerCase();
         const googleId = String(user.id || "").trim();
 
-        if (!email || !googleId) {
-            return res.send("فشل قراءة بيانات Google");
-        }
+        if (!email || !googleId) return res.send("فشل قراءة بيانات Google");
 
         const googleCustomId = "google_" + googleId;
         const emailMapKey = "google_email_map_" + email;
@@ -306,17 +271,12 @@ app.get("/auth/google/login/callback", async (req, res) => {
             Keys: [emailMapKey, customMapKey]
         });
 
-        if (mapResult.code !== 200) {
-            return res.send("فشل فحص الحساب");
-        }
-
         const maps =
             mapResult.data && mapResult.data.Data
                 ? mapResult.data.Data
                 : {};
 
         const playFabId = maps[emailMapKey];
-        let customId = maps[customMapKey];
 
         if (!playFabId) {
             await playFabPost("/Server/SetTitleInternalData", {
@@ -339,20 +299,31 @@ app.get("/auth/google/login/callback", async (req, res) => {
             `);
         }
 
-        if (!customId) {
-            customId = googleCustomId;
+        const linkResult = await playFabPost("/Server/LinkServerCustomId", {
+            PlayFabId: playFabId,
+            ServerCustomId: googleCustomId,
+            ForceLink: true
+        });
 
-            await playFabPost("/Server/LinkServerCustomId", {
-                PlayFabId: playFabId,
-                ServerCustomId: customId,
-                ForceLink: true
-            });
+        console.log("LOGIN LINK RESULT:", JSON.stringify(linkResult));
 
+        if (linkResult.code !== 200) {
             await playFabPost("/Server/SetTitleInternalData", {
-                Key: customMapKey,
-                Value: customId
+                Key: "google_login_session_" + session,
+                Value: JSON.stringify({
+                    ok: false,
+                    message: "فشل ربط دخول Google",
+                    email: email
+                })
             });
+
+            return res.send("فشل ربط دخول Google");
         }
+
+        await playFabPost("/Server/SetTitleInternalData", {
+            Key: customMapKey,
+            Value: googleCustomId
+        });
 
         await playFabPost("/Server/SetTitleInternalData", {
             Key: "google_login_session_" + session,
@@ -360,7 +331,7 @@ app.get("/auth/google/login/callback", async (req, res) => {
                 ok: true,
                 email: email,
                 playFabId: playFabId,
-                customId: customId
+                customId: googleCustomId
             })
         });
 
