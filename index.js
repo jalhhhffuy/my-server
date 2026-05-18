@@ -20,7 +20,9 @@ async function playFabPost(path, body) {
         return { code: 0, error: "PLAYFAB ENV MISSING" };
     }
 
-    const res = await fetch("https://" + titleId + ".playfabapi.com" + path, {
+    const url = "https://" + titleId + ".playfabapi.com" + path;
+
+    const res = await fetch(url, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -29,7 +31,26 @@ async function playFabPost(path, body) {
         body: JSON.stringify(body)
     });
 
-    return await res.json();
+    const text = await res.text();
+
+    if (!text) {
+        return {
+            code: res.status,
+            error: "EMPTY_PLAYFAB_RESPONSE",
+            url: url
+        };
+    }
+
+    try {
+        return JSON.parse(text);
+    } catch (e) {
+        return {
+            code: res.status,
+            error: "INVALID_JSON_FROM_PLAYFAB",
+            raw: text,
+            url: url
+        };
+    }
 }
 
 async function getGoogleUser(code, redirectUri) {
@@ -173,7 +194,7 @@ app.get("/auth/google/callback", async (req, res) => {
         });
 
         if (savePlayer.code !== 200) {
-            console.log("SAVE PLAYER ERROR:", savePlayer);
+            console.log("SAVE PLAYER ERROR:", JSON.stringify(savePlayer));
             return res.send("فشل حفظ الربط");
         }
 
@@ -186,7 +207,7 @@ app.get("/auth/google/callback", async (req, res) => {
         console.log("LINK GOOGLE CUSTOM ID:", JSON.stringify(linkCustom));
 
         if (linkCustom.code !== 200) {
-            return res.send("فشل ربط Google بالدخول");
+            return res.send("فشل ربط Google بالدخول: " + JSON.stringify(linkCustom));
         }
 
         await playFabPost("/Server/SetTitleInternalData", {
@@ -320,7 +341,7 @@ app.get("/auth/google/login/callback", async (req, res) => {
                 })
             });
 
-            return res.send("فشل ربط دخول Google");
+            return res.send("فشل ربط دخول Google: " + JSON.stringify(linkResult));
         }
 
         await playFabPost("/Server/SetTitleInternalData", {
