@@ -36,7 +36,10 @@ async function getGoogleUser(code, redirectUri) {
     const clientId = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
-    if (!clientId || !clientSecret) return null;
+    if (!clientId || !clientSecret) {
+        console.log("GOOGLE ENV MISSING");
+        return null;
+    }
 
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
         method: "POST",
@@ -174,9 +177,9 @@ app.get("/auth/google/callback", async (req, res) => {
             return res.send("فشل حفظ الربط");
         }
 
-        const linkCustom = await playFabPost("/Server/LinkServerCustomId", {
+        const linkCustom = await playFabPost("/Server/LinkCustomID", {
             PlayFabId: playFabId,
-            ServerCustomId: googleCustomId,
+            CustomId: googleCustomId,
             ForceLink: true
         });
 
@@ -299,9 +302,9 @@ app.get("/auth/google/login/callback", async (req, res) => {
             `);
         }
 
-        const linkResult = await playFabPost("/Server/LinkServerCustomId", {
+        const linkResult = await playFabPost("/Server/LinkCustomID", {
             PlayFabId: playFabId,
-            ServerCustomId: googleCustomId,
+            CustomId: googleCustomId,
             ForceLink: true
         });
 
