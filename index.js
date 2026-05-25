@@ -1,4 +1,5 @@
 const express = require("express");
+const bcrypt = require("bcryptjs");
 
 const app = express();
 app.use(express.json());
@@ -16,9 +17,8 @@ function getPlayFabConfig() {
 async function playFabPost(path, body) {
     const { titleId, secretKey } = getPlayFabConfig();
 
-    if (!titleId || !secretKey) {
+    if (!titleId || !secretKey)
         return { code: 0, error: "PLAYFAB ENV MISSING" };
-    }
 
     const url = "https://" + titleId + ".playfabapi.com" + path;
 
@@ -33,9 +33,8 @@ async function playFabPost(path, body) {
 
     const text = await res.text();
 
-    if (!text) {
+    if (!text)
         return { code: res.status, error: "EMPTY_PLAYFAB_RESPONSE", url };
-    }
 
     try {
         return JSON.parse(text);
@@ -48,10 +47,8 @@ async function getGoogleUser(code, redirectUri) {
     const clientId = process.env.GOOGLE_CLIENT_ID;
     const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
 
-    if (!clientId || !clientSecret) {
-        console.log("GOOGLE ENV MISSING");
+    if (!clientId || !clientSecret)
         return null;
-    }
 
     const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
         method: "POST",
@@ -66,16 +63,22 @@ async function getGoogleUser(code, redirectUri) {
 
     const tokenData = await tokenRes.json();
 
-    if (!tokenData.access_token) {
-        console.log("TOKEN ERROR:", tokenData);
+    if (!tokenData.access_token)
         return null;
-    }
 
     const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
         headers: { Authorization: "Bearer " + tokenData.access_token }
     });
 
     return await userRes.json();
+}
+
+function cleanEmail(email) {
+    return String(email || "").trim().toLowerCase();
+}
+
+function cleanPassword(password) {
+    return String(password || "").trim();
 }
 
 app.get("/", (req, res) => {
@@ -100,6 +103,190 @@ app.post("/guest", (req, res) => {
         success: true,
         playerId: "guest_" + installId
     });
+});
+
+// ===============================
+// كلمة مرور داخل اللعبة
+// ===============================
+
+app.post("/account/set-password", async (req, res) => {
+    try {
+        const playFabId = String(req.body.playFabId || "").trim();
+        const email = cleanEmail(req.body.email);
+        const password = cleanPassword(req.body.password);
+
+        if (!playFabId || !email || !password) {
+            return res.status(400).json({
+                ok: false,
+                message: "playFabId / email / password مطلوب"
+            });
+        }
+
+        if (password.length < 6) {
+            return res.status(400).json({
+                ok: false,
+                message: "كلمة المرور لازم تكون 6 أحرف أو أكثر"
+            });
+        }
+
+        const userData = await playFabPost("/Server/GetUserData", {
+            PlayFabId: playFabId,
+            Keys: [
+                "google_email",
+                "account_email",
+                "account_email_verified",
+                "account_status",
+                "google_custom_id"
+            ]
+        });
+
+        if (userData.code !== 200) {
+            return res.status(500).json({
+                ok: false,
+                message: "فشل فحص الحساب"
+            });
+        }
+
+        const data = userData.data && userData.data.Data ? userData.data.Data : {};
+
+        const accountEmail =
+            data.account_email && data.account_email.Value
+                ? cleanEmail(data.account_email.Value)
+                : "";
+
+        const googleEmail =
+            data.google_email && data.google_email.Value
+                ? cleanEmail(data.google_email.Value)
+                : "";
+
+        const verified =
+            data.account_email_verified &&
+            data.account_email_verified.Value === "1";
+
+        const official =
+            data.account_status &&
+            data.account_status.Value === "official";
+
+        if (email !== accountEmail && email !== googleEmail) {
+            return res.status(403).json({
+                ok: false,
+                message: "البريد لا يطابق الحساب"
+            });
+        }
+
+        if (!verified || !official) {
+            return res.status(403).json({
+                ok: false,
+                message: "الحساب غير موثق"
+            });
+        }
+
+        const googleCustomId =
+            data.google_custom_id && data.google_custom_id.Value
+                ? String(data.google_custom_id.Value)
+                : "";
+
+        if (!googleCustomId) {
+            return res.status(400).json({
+                ok: false,
+                message: "google_custom_id غير موجود"
+            });
+        }
+
+        const hash = await bcrypt.hash(password, 12);
+
+        await playFabPost("/Server/SetTitleInternalData", {
+            Key: "email_password_hash_" + email,
+            Value: hash
+        });
+
+        await playFabPost("/Server/SetTitleInternalData", {
+            Key: "email_password_playfab_" + email,
+            Value: playFabId
+        });
+
+        await playFabPost("/Server/SetTitleInternalData", {
+            Key: "email_password_custom_" + email,
+            Value: googleCustomId
+        });
+
+        return res.json({
+            ok: true,
+            message: "تم حفظ كلمة مرور اللعبة"
+        });
+
+    } catch (e) {
+        console.log("SET PASSWORD ERROR:", e);
+        return res.status(500).json({
+            ok: false,
+            message: "خطأ في السيرفر"
+        });
+    }
+});
+
+app.post("/account/login-email-password", async (req, res) => {
+    try {
+        const email = cleanEmail(req.body.email);
+        const password = cleanPassword(req.body.password);
+
+        if (!email || !password) {
+            return res.status(400).json({
+                ok: false,
+                message: "email / password مطلوب"
+            });
+        }
+
+        const hashKey = "email_password_hash_" + email;
+        const playFabKey = "email_password_playfab_" + email;
+        const customKey = "email_password_custom_" + email;
+
+        const result = await playFabPost("/Server/GetTitleInternalData", {
+            Keys: [hashKey, playFabKey, customKey]
+        });
+
+        if (result.code !== 200) {
+            return res.status(500).json({
+                ok: false,
+                message: "فشل فحص الحساب"
+            });
+        }
+
+        const maps = result.data && result.data.Data ? result.data.Data : {};
+
+        const passwordHash = maps[hashKey] || "";
+        const playFabId = maps[playFabKey] || "";
+        const customId = maps[customKey] || "";
+
+        if (!passwordHash || !playFabId || !customId) {
+            return res.status(404).json({
+                ok: false,
+                message: "هذا البريد لا يملك كلمة مرور لعبة"
+            });
+        }
+
+        const match = await bcrypt.compare(password, passwordHash);
+
+        if (!match) {
+            return res.status(401).json({
+                ok: false,
+                message: "كلمة المرور غير صحيحة"
+            });
+        }
+
+        return res.json({
+            ok: true,
+            email,
+            playFabId,
+            customId
+        });
+
+    } catch (e) {
+        console.log("EMAIL PASSWORD LOGIN ERROR:", e);
+        return res.status(500).json({
+            ok: false,
+            message: "خطأ في السيرفر"
+        });
+    }
 });
 
 // ===============================
@@ -143,7 +330,7 @@ app.get("/auth/google/callback", async (req, res) => {
 
         if (!user) return res.send("فشل أخذ توكن Google");
 
-        const email = String(user.email || "").trim().toLowerCase();
+        const email = cleanEmail(user.email);
         const googleId = String(user.id || "").trim();
 
         if (!email || !googleId) return res.send("فشل قراءة بيانات Google");
@@ -158,19 +345,16 @@ app.get("/auth/google/callback", async (req, res) => {
             Keys: [googleIdMapKey, googleEmailMapKey, googleCustomMapKey]
         });
 
-        if (checkMap.code !== 200) {
+        if (checkMap.code !== 200)
             return res.send("فشل فحص الربط: " + JSON.stringify(checkMap));
-        }
 
         const maps = checkMap.data && checkMap.data.Data ? checkMap.data.Data : {};
 
-        if (maps[googleIdMapKey] && maps[googleIdMapKey] !== playFabId) {
+        if (maps[googleIdMapKey] && maps[googleIdMapKey] !== playFabId)
             return res.send("هذا Google مربوط بحساب آخر");
-        }
 
-        if (maps[googleEmailMapKey] && maps[googleEmailMapKey] !== playFabId) {
+        if (maps[googleEmailMapKey] && maps[googleEmailMapKey] !== playFabId)
             return res.send("هذا البريد مربوط بحساب آخر");
-        }
 
         const savePlayer = await playFabPost("/Server/UpdateUserData", {
             PlayFabId: playFabId,
@@ -186,17 +370,8 @@ app.get("/auth/google/callback", async (req, res) => {
             }
         });
 
-        console.log("SAVE GOOGLE USERDATA:", JSON.stringify({
-            playFabId,
-            email,
-            googleId,
-            googleCustomId,
-            result: savePlayer
-        }));
-
-        if (savePlayer.code !== 200) {
+        if (savePlayer.code !== 200)
             return res.send("فشل حفظ الربط: " + JSON.stringify(savePlayer));
-        }
 
         await playFabPost("/Server/SetTitleInternalData", {
             Key: googleIdMapKey,
@@ -221,9 +396,8 @@ app.get("/auth/google/callback", async (req, res) => {
         return res.send(`
             <html>
             <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
-                <h2>تم ربط Google بنجاح ✅</h2>
-                <p>${email}</p>
-                <p>ارجع إلى اللعبة وافتح الحساب مرة ثانية</p>
+                <h2>ارجع إلى اللعبة</h2>
+                <p>سيتم تحديث البريد من داخل اللعبة</p>
             </body>
             </html>
         `);
@@ -275,7 +449,7 @@ app.get("/auth/google/login/callback", async (req, res) => {
 
         if (!user) return res.send("فشل تسجيل Google");
 
-        const email = String(user.email || "").trim().toLowerCase();
+        const email = cleanEmail(user.email);
         const googleId = String(user.id || "").trim();
 
         if (!email || !googleId) return res.send("فشل قراءة بيانات Google");
@@ -289,9 +463,8 @@ app.get("/auth/google/login/callback", async (req, res) => {
             Keys: [emailMapKey, customMapKey]
         });
 
-        if (mapResult.code !== 200) {
+        if (mapResult.code !== 200)
             return res.send("فشل فحص الحساب: " + JSON.stringify(mapResult));
-        }
 
         const maps = mapResult.data && mapResult.data.Data ? mapResult.data.Data : {};
 
