@@ -1740,7 +1740,7 @@ app.post(
                         updatedUnix
                 });
         }
-        catch (error) {
+                catch (error) {
             console.log(
                 "UPLOAD AVATAR ERROR:",
                 error
@@ -1761,3 +1761,58 @@ app.post(
         }
     }
 );
+
+
+// =====================================================
+// معالجة أخطاء رفع الصور
+// =====================================================
+
+app.use((error, req, res, next) => {
+    if (error instanceof multer.MulterError) {
+        if (error.code === "LIMIT_FILE_SIZE") {
+            return res.status(413).json({
+                ok: false,
+                success: false,
+                message: "حجم الصورة أكبر من 4 ميجابايت"
+            });
+        }
+
+        return res.status(400).json({
+            ok: false,
+            success: false,
+            message: "فشل استقبال الصورة"
+        });
+    }
+
+    if (error) {
+        console.log(
+            "SERVER MIDDLEWARE ERROR:",
+            error
+        );
+
+        return res.status(400).json({
+            ok: false,
+            success: false,
+
+            message:
+                error.message ||
+                "حدث خطأ أثناء استقبال الطلب"
+        });
+    }
+
+    next();
+});
+
+
+// =====================================================
+// Start Server
+// =====================================================
+
+const PORT =
+    process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+    console.log(
+        "Server running on port " + PORT
+    );
+});
