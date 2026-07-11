@@ -8,6 +8,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "nodemailer": "^6.9.16",
-    "bcryptjs": "^2.4.3"
+    "bcryptjs": "^2.4.3",
+    "multer": "^2.0.2",
+    "cloudinary": "^2.7.0"
   }
 }
