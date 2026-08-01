@@ -1,6 +1,7 @@
-const express = require("express");
+   const express = require("express");
 const bcrypt = require("bcryptjs");
 const multer = require("multer");
+const crypto = require("crypto");
 const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
@@ -41,7 +42,6 @@ const avatarUpload = multer({
         multer.memoryStorage(),
 
     limits: {
-        // أقصى حجم للصورة: 4 ميجابايت
         fileSize:
             4 * 1024 * 1024
     },
@@ -201,6 +201,7 @@ async function authenticatePlayFabSession(
     if (!sessionTicket) {
         return {
             success: false,
+
             message:
                 "SessionTicket غير موجود"
         };
@@ -344,11 +345,14 @@ function cleanPassword(password) {
 // Root
 // =====================================================
 
-app.get("/", (req, res) => {
-    res.send(
-        "Server is working 🔥"
-    );
-});
+app.get(
+    "/",
+    (req, res) => {
+        res.send(
+            "Server is working 🔥"
+        );
+    }
+);
 
 
 // =====================================================
@@ -360,6 +364,7 @@ app.get(
     (req, res) => {
         res.json({
             ok: true,
+
             message:
                 "server awake"
         });
@@ -382,6 +387,7 @@ app.post(
                 .status(400)
                 .json({
                     success: false,
+
                     message:
                         "installId required"
                 });
@@ -474,6 +480,7 @@ app.post(
                     .status(500)
                     .json({
                         ok: false,
+
                         message:
                             "فشل فحص الحساب"
                     });
@@ -521,6 +528,7 @@ app.post(
                     .status(403)
                     .json({
                         ok: false,
+
                         message:
                             "البريد لا يطابق الحساب"
                     });
@@ -534,6 +542,7 @@ app.post(
                     .status(403)
                     .json({
                         ok: false,
+
                         message:
                             "الحساب غير موثق"
                     });
@@ -618,6 +627,7 @@ app.post(
                 .status(500)
                 .json({
                     ok: false,
+
                     message:
                         "خطأ في السيرفر"
                 });
@@ -744,8 +754,11 @@ app.post(
 
             return res.json({
                 ok: true,
+
                 email,
+
                 playFabId,
+
                 customId
             });
         }
@@ -759,6 +772,7 @@ app.post(
                 .status(500)
                 .json({
                     ok: false,
+
                     message:
                         "خطأ في السيرفر"
                 });
@@ -1290,6 +1304,7 @@ app.get(
                     Value:
                         JSON.stringify({
                             ok: true,
+
                             email:
                                 email,
 
@@ -1350,6 +1365,7 @@ app.get(
         if (!session) {
             return res.json({
                 ok: false,
+
                 done: false,
 
                 message:
@@ -1381,6 +1397,7 @@ app.get(
         if (!raw) {
             return res.json({
                 ok: false,
+
                 done: false,
 
                 message:
@@ -1401,6 +1418,7 @@ app.get(
         catch {
             return res.json({
                 ok: false,
+
                 done: true,
 
                 message:
@@ -1410,14 +1428,20 @@ app.get(
     }
 );
 
+
 // =====================================================
-// رفع الصورة الشخصية
+// رفع الصورة الشخصية مؤقتًا فقط
 //
 // POST /upload-avatar
 //
-// يستقبل:
-// X-Authorization = PlayFab SessionTicket
-// avatar = image file
+// مهم:
+// - يتحقق من جلسة PlayFab.
+// - يرفع الصورة إلى Cloudinary فقط.
+// - لا يحفظ رابط الصورة في PlayFab.
+// - لا يستدعي UpdateAvatarUrl.
+// - لا يستدعي UpdateUserData.
+// - الحفظ الرسمي والخصم يتمان فقط داخل:
+//   SaveProfileChangesWithRubies
 // =====================================================
 
 app.post(
@@ -1425,11 +1449,25 @@ app.post(
     avatarUpload.single("avatar"),
     async (req, res) => {
         try {
-            // Unity يرسل SessionTicket داخل X-Authorization.
-            // أبقينا دعم body أيضًا للتوافق مع أي نسخة قديمة.
+            const authorizationHeader =
+                String(
+                    req.headers["authorization"] ||
+                    ""
+                ).trim();
+
+            const bearerTicket =
+                authorizationHeader
+                    .toLowerCase()
+                    .startsWith("bearer ")
+                    ? authorizationHeader
+                        .substring(7)
+                        .trim()
+                    : "";
+
             const sessionTicket =
                 String(
                     req.headers["x-authorization"] ||
+                    bearerTicket ||
                     req.body.sessionTicket ||
                     ""
                 ).trim();
@@ -1443,7 +1481,9 @@ app.post(
                     .status(401)
                     .json({
                         ok: false,
+
                         success: false,
+
                         message:
                             "جلسة اللاعب غير موجودة"
                     });
@@ -1457,13 +1497,14 @@ app.post(
                     .status(400)
                     .json({
                         ok: false,
+
                         success: false,
+
                         message:
                             "لم يتم إرسال الصورة"
                     });
             }
 
-            // التحقق من جلسة PlayFab وأخذ معرف اللاعب الحقيقي.
             const authResult =
                 await authenticatePlayFabSession(
                     sessionTicket
@@ -1480,7 +1521,9 @@ app.post(
                     .status(401)
                     .json({
                         ok: false,
+
                         success: false,
+
                         message:
                             authResult.message ||
                             "جلسة PlayFab غير صالحة"
@@ -1504,20 +1547,60 @@ app.post(
                     .status(400)
                     .json({
                         ok: false,
+
                         success: false,
+
                         message:
                             "معرف اللاعب غير صالح"
                     });
             }
 
-            // نفس public_id يعني أن الصورة الجديدة تستبدل القديمة.
+            const rawRequestId =
+                String(
+                    req.body.requestId ||
+                    ""
+                ).trim();
+
+            const safeRequestId =
+                rawRequestId
+                    .replace(
+                        /[^a-zA-Z0-9_-]/g,
+                        ""
+                    )
+                    .substring(
+                        0,
+                        100
+                    );
+
+            const draftId =
+                safeRequestId ||
+                (
+                    Date.now() +
+                    "_" +
+                    crypto
+                        .randomBytes(8)
+                        .toString("hex")
+                );
+
+            /*
+             * لا نرفع فوق player_avatars/<PlayFabId>
+             * لأن ذلك يستبدل ملف الصورة الحالية في Cloudinary
+             * حتى قبل نجاح الخصم.
+             *
+             * كل محاولة تحصل على رابط مؤقت مستقل.
+             */
             const publicId =
-                "player_avatars/" +
-                safePlayFabId;
+                "player_avatar_drafts/" +
+                safePlayFabId +
+                "/" +
+                draftId;
 
             const uploadResult =
                 await new Promise(
-                    (resolve, reject) => {
+                    (
+                        resolve,
+                        reject
+                    ) => {
                         const uploadStream =
                             cloudinary.uploader
                                 .upload_stream(
@@ -1540,9 +1623,14 @@ app.post(
                                         transformation: [
                                             {
                                                 width: 512,
+
                                                 height: 512,
-                                                crop: "fill",
-                                                gravity: "auto"
+
+                                                crop:
+                                                    "fill",
+
+                                                gravity:
+                                                    "auto"
                                             },
                                             {
                                                 quality:
@@ -1582,7 +1670,9 @@ app.post(
                     .status(500)
                     .json({
                         ok: false,
+
                         success: false,
+
                         message:
                             "لم يتم إنشاء رابط الصورة"
                     });
@@ -1591,7 +1681,7 @@ app.post(
             const avatarUrl =
                 String(
                     uploadResult.secure_url
-                );
+                ).trim();
 
             const avatarVersion =
                 uploadResult.version
@@ -1607,113 +1697,51 @@ app.post(
                     Date.now() / 1000
                 );
 
-            // حفظ رابط الصورة في ملف PlayFab الأساسي.
-            const updateAvatarResult =
-                await playFabPost(
-                    "/Server/UpdateAvatarUrl",
-                    {
-                        PlayFabId:
-                            playFabId,
-
-                        ImageUrl:
-                            avatarUrl
-                    }
-                );
-
-            if (
-                updateAvatarResult.code !== 200
-            ) {
-                console.log(
-                    "PLAYFAB UPDATE AVATAR URL ERROR:",
-                    JSON.stringify(
-                        updateAvatarResult
-                    )
-                );
-
-                return res
-                    .status(500)
-                    .json({
-                        ok: false,
-                        success: false,
-                        message:
-                            "تم رفع الصورة لكن فشل ربطها بالحساب"
-                    });
-            }
-
-            // حفظ الرابط والنسخة كبيانات عامة،
-            // حتى يستطيع ترتيب اللاعبين قراءتها.
-            const updateDataResult =
-                await playFabPost(
-                    "/Server/UpdateUserData",
-                    {
-                        PlayFabId:
-                            playFabId,
-
-                        Data: {
-                            avatar_uploaded:
-                                "1",
-
-                            avatar_url:
-                                avatarUrl,
-
-                            avatar_version:
-                                avatarVersion,
-
-                            avatar_updated_unix:
-                                String(
-                                    updatedUnix
-                                ),
-
-                            // لم نعد نستخدم Entity Files.
-                            avatar_file_name:
-                                ""
-                        },
-
-                        Permission:
-                            "Public"
-                    }
-                );
-
-            if (
-                updateDataResult.code !== 200
-            ) {
-                console.log(
-                    "PLAYFAB AVATAR DATA ERROR:",
-                    JSON.stringify(
-                        updateDataResult
-                    )
-                );
-
-                return res
-                    .status(500)
-                    .json({
-                        ok: false,
-                        success: false,
-                        message:
-                            "تم رفع الصورة لكن فشل حفظ بياناتها"
-                    });
-            }
+            /*
+             * لا يوجد أي استدعاء PlayFab لتحديث الصورة هنا.
+             *
+             * Unity يأخذ avatarUrl و avatarVersion ثم يرسلها إلى:
+             * SaveProfileChangesWithRubies
+             *
+             * CloudScript هو المسؤول عن:
+             * - التأكد من السعر.
+             * - خصم الياقوت.
+             * - زيادة العداد.
+             * - حفظ avatar_url و avatar_version.
+             * - تحديث UpdateAvatarUrl الرسمي.
+             */
 
             console.log(
-                "AVATAR UPLOADED SUCCESS:",
+                "AVATAR DRAFT UPLOADED:",
                 playFabId,
+                draftId,
                 avatarVersion,
                 avatarUrl
             );
 
-            // نرجع أكثر من اسم للرابط،
-            // حتى تعمل جميع نسخ سكربت Unity.
             return res
                 .status(200)
                 .json({
                     ok: true,
+
                     success: true,
 
                     message:
-                        "تم رفع الصورة بنجاح",
+                        "تم رفع الصورة مؤقتًا",
+
+                    draft: true,
 
                     playFabId:
                         playFabId,
+
+                    requestId:
+                        safeRequestId,
+
+                    draftId:
+                        draftId,
+
+                    draftPublicId:
+                        publicId,
 
                     avatarUrl:
                         avatarUrl,
@@ -1740,7 +1768,7 @@ app.post(
                         updatedUnix
                 });
         }
-                catch (error) {
+        catch (error) {
             console.log(
                 "UPLOAD AVATAR ERROR:",
                 error
@@ -1750,6 +1778,7 @@ app.post(
                 .status(500)
                 .json({
                     ok: false,
+
                     success: false,
 
                     message:
@@ -1767,41 +1796,67 @@ app.post(
 // معالجة أخطاء رفع الصور
 // =====================================================
 
-app.use((error, req, res, next) => {
-    if (error instanceof multer.MulterError) {
-        if (error.code === "LIMIT_FILE_SIZE") {
-            return res.status(413).json({
-                ok: false,
-                success: false,
-                message: "حجم الصورة أكبر من 4 ميجابايت"
-            });
+app.use(
+    (
+        error,
+        req,
+        res,
+        next
+    ) => {
+        if (
+            error instanceof
+            multer.MulterError
+        ) {
+            if (
+                error.code ===
+                "LIMIT_FILE_SIZE"
+            ) {
+                return res
+                    .status(413)
+                    .json({
+                        ok: false,
+
+                        success: false,
+
+                        message:
+                            "حجم الصورة أكبر من 4 ميجابايت"
+                    });
+            }
+
+            return res
+                .status(400)
+                .json({
+                    ok: false,
+
+                    success: false,
+
+                    message:
+                        "فشل استقبال الصورة"
+                });
         }
 
-        return res.status(400).json({
-            ok: false,
-            success: false,
-            message: "فشل استقبال الصورة"
-        });
+        if (error) {
+            console.log(
+                "SERVER MIDDLEWARE ERROR:",
+                error
+            );
+
+            return res
+                .status(400)
+                .json({
+                    ok: false,
+
+                    success: false,
+
+                    message:
+                        error.message ||
+                        "حدث خطأ أثناء استقبال الطلب"
+                });
+        }
+
+        next();
     }
-
-    if (error) {
-        console.log(
-            "SERVER MIDDLEWARE ERROR:",
-            error
-        );
-
-        return res.status(400).json({
-            ok: false,
-            success: false,
-
-            message:
-                error.message ||
-                "حدث خطأ أثناء استقبال الطلب"
-        });
-    }
-
-    next();
-});
+);
 
 
 // =====================================================
@@ -1809,10 +1864,15 @@ app.use((error, req, res, next) => {
 // =====================================================
 
 const PORT =
-    process.env.PORT || 3000;
+    process.env.PORT ||
+    3000;
 
-app.listen(PORT, () => {
-    console.log(
-        "Server running on port " + PORT
-    );
-});
+app.listen(
+    PORT,
+    () => {
+        console.log(
+            "Server running on port " +
+            PORT
+        );
+    }
+);
