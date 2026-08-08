@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const bcrypt = require("bcryptjs");
 const multer = require("multer");
 const crypto = require("crypto");
@@ -79,7 +79,7 @@ const avatarUpload = multer({
         ) {
             return callback(
                 new Error(
-                    "ÙÙØ¹ Ø§ÙØµÙØ±Ø© ØºÙØ± ÙØ¯Ø¹ÙÙ"
+                    "نوع الصورة غير مدعوم"
                 )
             );
         }
@@ -216,7 +216,7 @@ async function authenticatePlayFabSession(
             success: false,
 
             message:
-                "SessionTicket ØºÙØ± ÙÙØ¬ÙØ¯"
+                "SessionTicket غير موجود"
         };
     }
 
@@ -239,7 +239,7 @@ async function authenticatePlayFabSession(
             success: false,
 
             message:
-                "Ø¬ÙØ³Ø© PlayFab ØºÙØ± ØµØ§ÙØ­Ø©",
+                "جلسة PlayFab غير صالحة",
 
             details:
                 result
@@ -362,7 +362,7 @@ app.get(
     "/",
     (req, res) => {
         res.send(
-            "Server is working ð¥"
+            "Server is working 🔥"
         );
     }
 );
@@ -418,7 +418,7 @@ app.post(
 
 
 // =====================================================
-// ÙÙÙØ© ÙØ±ÙØ± Ø¯Ø§Ø®Ù Ø§ÙÙØ¹Ø¨Ø©
+// كلمة مرور داخل اللعبة
 // =====================================================
 
 app.post(
@@ -452,7 +452,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "playFabId / email / password ÙØ·ÙÙØ¨"
+                            "playFabId / email / password مطلوب"
                     });
             }
 
@@ -465,7 +465,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "ÙÙÙØ© Ø§ÙÙØ±ÙØ± ÙØ§Ø²Ù ØªÙÙÙ 6 Ø£Ø­Ø±Ù Ø£Ù Ø£ÙØ«Ø±"
+                            "كلمة المرور لازم تكون 6 أحرف أو أكثر"
                     });
             }
 
@@ -495,7 +495,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "ÙØ´Ù ÙØ­Øµ Ø§ÙØ­Ø³Ø§Ø¨"
+                            "فشل فحص الحساب"
                     });
             }
 
@@ -543,7 +543,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "Ø§ÙØ¨Ø±ÙØ¯ ÙØ§ ÙØ·Ø§Ø¨Ù Ø§ÙØ­Ø³Ø§Ø¨"
+                            "البريد لا يطابق الحساب"
                     });
             }
 
@@ -557,7 +557,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "Ø§ÙØ­Ø³Ø§Ø¨ ØºÙØ± ÙÙØ«Ù"
+                            "الحساب غير موثق"
                     });
             }
 
@@ -577,7 +577,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "google_custom_id ØºÙØ± ÙÙØ¬ÙØ¯"
+                            "google_custom_id غير موجود"
                     });
             }
 
@@ -627,7 +627,7 @@ app.post(
                 ok: true,
 
                 message:
-                    "ØªÙ Ø­ÙØ¸ ÙÙÙØ© ÙØ±ÙØ± Ø§ÙÙØ¹Ø¨Ø©"
+                    "تم حفظ كلمة مرور اللعبة"
             });
         }
         catch (error) {
@@ -642,7 +642,7 @@ app.post(
                     ok: false,
 
                     message:
-                        "Ø®Ø·Ø£ ÙÙ Ø§ÙØ³ÙØ±ÙØ±"
+                        "خطأ في السيرفر"
                 });
         }
     }
@@ -677,7 +677,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "email / password ÙØ·ÙÙØ¨"
+                            "email / password مطلوب"
                     });
             }
 
@@ -714,7 +714,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "ÙØ´Ù ÙØ­Øµ Ø§ÙØ­Ø³Ø§Ø¨"
+                            "فشل فحص الحساب"
                     });
             }
 
@@ -744,7 +744,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "ÙØ°Ø§ Ø§ÙØ¨Ø±ÙØ¯ ÙØ§ ÙÙÙÙ ÙÙÙØ© ÙØ±ÙØ± ÙØ¹Ø¨Ø©"
+                            "هذا البريد لا يملك كلمة مرور لعبة"
                     });
             }
 
@@ -761,7 +761,7 @@ app.post(
                         ok: false,
 
                         message:
-                            "ÙÙÙØ© Ø§ÙÙØ±ÙØ± ØºÙØ± ØµØ­ÙØ­Ø©"
+                            "كلمة المرور غير صحيحة"
                     });
             }
 
@@ -787,7 +787,7 @@ app.post(
                     ok: false,
 
                     message:
-                        "Ø®Ø·Ø£ ÙÙ Ø§ÙØ³ÙØ±ÙØ±"
+                        "خطأ في السيرفر"
                 });
         }
     }
@@ -795,7 +795,7 @@ app.post(
 
 
 // =====================================================
-// Ø±Ø¨Ø· Google Ø¨Ø­Ø³Ø§Ø¨ Ø§ÙÙØ§Ø¹Ø¨ Ø§ÙØ­Ø§ÙÙ
+// ربط Google بحساب اللاعب الحالي
 // =====================================================
 
 app.get(
@@ -809,7 +809,7 @@ app.get(
 
         if (!playFabId) {
             return res.send(
-                "playFabId ÙÙÙÙØ¯"
+                "playFabId مفقود"
             );
         }
 
@@ -819,7 +819,7 @@ app.get(
 
         if (!clientId) {
             return res.send(
-                "GOOGLE_CLIENT_ID ÙØ§ÙØµ"
+                "GOOGLE_CLIENT_ID ناقص"
             );
         }
 
@@ -877,7 +877,7 @@ app.get(
                 !playFabId
             ) {
                 return res.send(
-                    "ÙØ´Ù Ø§ÙØ±Ø¨Ø·: Ø¨ÙØ§ÙØ§Øª ÙØ§ÙØµØ©"
+                    "فشل الربط: بيانات ناقصة"
                 );
             }
 
@@ -893,7 +893,7 @@ app.get(
 
             if (!user) {
                 return res.send(
-                    "ÙØ´Ù Ø£Ø®Ø° ØªÙÙÙ Google"
+                    "فشل أخذ توكن Google"
                 );
             }
 
@@ -912,7 +912,7 @@ app.get(
                 !googleId
             ) {
                 return res.send(
-                    "ÙØ´Ù ÙØ±Ø§Ø¡Ø© Ø¨ÙØ§ÙØ§Øª Google"
+                    "فشل قراءة بيانات Google"
                 );
             }
 
@@ -948,7 +948,7 @@ app.get(
                 checkMap.code !== 200
             ) {
                 return res.send(
-                    "ÙØ´Ù ÙØ­Øµ Ø§ÙØ±Ø¨Ø·: " +
+                    "فشل فحص الربط: " +
                     JSON.stringify(
                         checkMap
                     )
@@ -967,7 +967,7 @@ app.get(
                     playFabId
             ) {
                 return res.send(
-                    "ÙØ°Ø§ Google ÙØ±Ø¨ÙØ· Ø¨Ø­Ø³Ø§Ø¨ Ø¢Ø®Ø±"
+                    "هذا Google مربوط بحساب آخر"
                 );
             }
 
@@ -977,7 +977,7 @@ app.get(
                     playFabId
             ) {
                 return res.send(
-                    "ÙØ°Ø§ Ø§ÙØ¨Ø±ÙØ¯ ÙØ±Ø¨ÙØ· Ø¨Ø­Ø³Ø§Ø¨ Ø¢Ø®Ø±"
+                    "هذا البريد مربوط بحساب آخر"
                 );
             }
 
@@ -1020,7 +1020,7 @@ app.get(
                 savePlayer.code !== 200
             ) {
                 return res.send(
-                    "ÙØ´Ù Ø­ÙØ¸ Ø§ÙØ±Ø¨Ø·: " +
+                    "فشل حفظ الربط: " +
                     JSON.stringify(
                         savePlayer
                     )
@@ -1075,8 +1075,8 @@ app.get(
             return res.send(`
                 <html>
                 <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
-                    <h2>Ø§Ø±Ø¬Ø¹ Ø¥ÙÙ Ø§ÙÙØ¹Ø¨Ø©</h2>
-                    <p>Ø³ÙØªÙ ØªØ­Ø¯ÙØ« Ø§ÙØ¨Ø±ÙØ¯ ÙÙ Ø¯Ø§Ø®Ù Ø§ÙÙØ¹Ø¨Ø©</p>
+                    <h2>ارجع إلى اللعبة</h2>
+                    <p>سيتم تحديث البريد من داخل اللعبة</p>
                 </body>
                 </html>
             `);
@@ -1088,7 +1088,7 @@ app.get(
             );
 
             return res.send(
-                "Ø­Ø¯Ø« Ø®Ø·Ø£ ÙÙ Ø§ÙØ³ÙØ±ÙØ±"
+                "حدث خطأ في السيرفر"
             );
         }
     }
@@ -1096,7 +1096,7 @@ app.get(
 
 
 // =====================================================
-// ØªØ³Ø¬ÙÙ Ø¯Ø®ÙÙ Google ÙÙ Ø´Ø§Ø´Ø© Login
+// تسجيل دخول Google من شاشة Login
 // =====================================================
 
 app.get(
@@ -1110,7 +1110,7 @@ app.get(
 
         if (!session) {
             return res.send(
-                "session ÙÙÙÙØ¯"
+                "session مفقود"
             );
         }
 
@@ -1120,7 +1120,7 @@ app.get(
 
         if (!clientId) {
             return res.send(
-                "GOOGLE_CLIENT_ID ÙØ§ÙØµ"
+                "GOOGLE_CLIENT_ID ناقص"
             );
         }
 
@@ -1178,7 +1178,7 @@ app.get(
                 !session
             ) {
                 return res.send(
-                    "ÙØ´Ù ØªØ³Ø¬ÙÙ Ø§ÙØ¯Ø®ÙÙ: Ø¨ÙØ§ÙØ§Øª ÙØ§ÙØµØ©"
+                    "فشل تسجيل الدخول: بيانات ناقصة"
                 );
             }
 
@@ -1194,7 +1194,7 @@ app.get(
 
             if (!user) {
                 return res.send(
-                    "ÙØ´Ù ØªØ³Ø¬ÙÙ Google"
+                    "فشل تسجيل Google"
                 );
             }
 
@@ -1213,7 +1213,7 @@ app.get(
                 !googleId
             ) {
                 return res.send(
-                    "ÙØ´Ù ÙØ±Ø§Ø¡Ø© Ø¨ÙØ§ÙØ§Øª Google"
+                    "فشل قراءة بيانات Google"
                 );
             }
 
@@ -1244,7 +1244,7 @@ app.get(
                 mapResult.code !== 200
             ) {
                 return res.send(
-                    "ÙØ´Ù ÙØ­Øµ Ø§ÙØ­Ø³Ø§Ø¨: " +
+                    "فشل فحص الحساب: " +
                     JSON.stringify(
                         mapResult
                     )
@@ -1277,7 +1277,7 @@ app.get(
                                 ok: false,
 
                                 message:
-                                    "ÙØ°Ø§ Ø§ÙØ¨Ø±ÙØ¯ ØºÙØ± ÙØ±Ø¨ÙØ· Ø¨Ø­Ø³Ø§Ø¨",
+                                    "هذا البريد غير مربوط بحساب",
 
                                 email:
                                     email
@@ -1288,9 +1288,9 @@ app.get(
                 return res.send(`
                     <html>
                     <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
-                        <h2>ÙØ°Ø§ Ø§ÙØ¨Ø±ÙØ¯ ØºÙØ± ÙØ±Ø¨ÙØ· Ø¨Ø­Ø³Ø§Ø¨ â</h2>
+                        <h2>هذا البريد غير مربوط بحساب ❌</h2>
                         <p>${email}</p>
-                        <p>Ø§Ø±Ø¬Ø¹ Ø¥ÙÙ Ø§ÙÙØ¹Ø¨Ø©</p>
+                        <p>ارجع إلى اللعبة</p>
                     </body>
                     </html>
                 `);
@@ -1341,9 +1341,9 @@ app.get(
                     </script>
                 </head>
                 <body style="font-family:sans-serif;text-align:center;padding-top:60px;direction:rtl;">
-                    <h2>ØªÙ ØªØ³Ø¬ÙÙ Ø§ÙØ¯Ø®ÙÙ Ø¨ÙØ¬Ø§Ø­ â</h2>
+                    <h2>تم تسجيل الدخول بنجاح ✅</h2>
                     <p>${email}</p>
-                    <p>Ø¬Ø§Ø±Ù Ø§ÙØ±Ø¬ÙØ¹ Ø¥ÙÙ Ø§ÙÙØ¹Ø¨Ø©...</p>
+                    <p>جاري الرجوع إلى اللعبة...</p>
                 </body>
                 </html>
             `);
@@ -1355,7 +1355,7 @@ app.get(
             );
 
             return res.send(
-                "Ø­Ø¯Ø« Ø®Ø·Ø£ Ø£Ø«ÙØ§Ø¡ ØªØ³Ø¬ÙÙ Ø§ÙØ¯Ø®ÙÙ"
+                "حدث خطأ أثناء تسجيل الدخول"
             );
         }
     }
@@ -1382,7 +1382,7 @@ app.get(
                 done: false,
 
                 message:
-                    "session ÙÙÙÙØ¯"
+                    "session مفقود"
             });
         }
 
@@ -1414,7 +1414,7 @@ app.get(
                 done: false,
 
                 message:
-                    "Ø§ÙØªØ¸Ø§Ø± ØªØ³Ø¬ÙÙ Google"
+                    "انتظار تسجيل Google"
             });
         }
 
@@ -1435,7 +1435,7 @@ app.get(
                 done: true,
 
                 message:
-                    "Ø±Ø¯ ØºÙØ± ØµØ§ÙØ­"
+                    "رد غير صالح"
             });
         }
     }
@@ -1443,17 +1443,17 @@ app.get(
 
 
 // =====================================================
-// Ø±ÙØ¹ Ø§ÙØµÙØ±Ø© Ø§ÙØ´Ø®ØµÙØ© ÙØ¤ÙØªÙØ§ ÙÙØ·
+// رفع الصورة الشخصية مؤقتًا فقط
 //
 // POST /upload-avatar
 //
-// ÙÙÙ:
-// - ÙØªØ­ÙÙ ÙÙ Ø¬ÙØ³Ø© PlayFab.
-// - ÙØ±ÙØ¹ Ø§ÙØµÙØ±Ø© Ø¥ÙÙ Cloudinary ÙÙØ·.
-// - ÙØ§ ÙØ­ÙØ¸ Ø±Ø§Ø¨Ø· Ø§ÙØµÙØ±Ø© ÙÙ PlayFab.
-// - ÙØ§ ÙØ³ØªØ¯Ø¹Ù UpdateAvatarUrl.
-// - ÙØ§ ÙØ³ØªØ¯Ø¹Ù UpdateUserData.
-// - Ø§ÙØ­ÙØ¸ Ø§ÙØ±Ø³ÙÙ ÙØ§ÙØ®ØµÙ ÙØªÙØ§Ù ÙÙØ· Ø¯Ø§Ø®Ù:
+// مهم:
+// - يتحقق من جلسة PlayFab.
+// - يرفع الصورة إلى Cloudinary فقط.
+// - لا يحفظ رابط الصورة في PlayFab.
+// - لا يستدعي UpdateAvatarUrl.
+// - لا يستدعي UpdateUserData.
+// - الحفظ الرسمي والخصم يتمان فقط داخل:
 //   SaveProfileChangesWithRubies
 // =====================================================
 
@@ -1498,7 +1498,7 @@ app.post(
                         success: false,
 
                         message:
-                            "Ø¬ÙØ³Ø© Ø§ÙÙØ§Ø¹Ø¨ ØºÙØ± ÙÙØ¬ÙØ¯Ø©"
+                            "جلسة اللاعب غير موجودة"
                     });
             }
 
@@ -1514,7 +1514,7 @@ app.post(
                         success: false,
 
                         message:
-                            "ÙÙ ÙØªÙ Ø¥Ø±Ø³Ø§Ù Ø§ÙØµÙØ±Ø©"
+                            "لم يتم إرسال الصورة"
                     });
             }
 
@@ -1539,7 +1539,7 @@ app.post(
 
                         message:
                             authResult.message ||
-                            "Ø¬ÙØ³Ø© PlayFab ØºÙØ± ØµØ§ÙØ­Ø©"
+                            "جلسة PlayFab غير صالحة"
                     });
             }
 
@@ -1564,7 +1564,7 @@ app.post(
                         success: false,
 
                         message:
-                            "ÙØ¹Ø±Ù Ø§ÙÙØ§Ø¹Ø¨ ØºÙØ± ØµØ§ÙØ­"
+                            "معرف اللاعب غير صالح"
                     });
             }
 
@@ -1596,11 +1596,11 @@ app.post(
                 );
 
             /*
-             * ÙØ§ ÙØ±ÙØ¹ ÙÙÙ player_avatars/<PlayFabId>
-             * ÙØ£Ù Ø°ÙÙ ÙØ³ØªØ¨Ø¯Ù ÙÙÙ Ø§ÙØµÙØ±Ø© Ø§ÙØ­Ø§ÙÙØ© ÙÙ Cloudinary
-             * Ø­ØªÙ ÙØ¨Ù ÙØ¬Ø§Ø­ Ø§ÙØ®ØµÙ.
+             * لا نرفع فوق player_avatars/<PlayFabId>
+             * لأن ذلك يستبدل ملف الصورة الحالية في Cloudinary
+             * حتى قبل نجاح الخصم.
              *
-             * ÙÙ ÙØ­Ø§ÙÙØ© ØªØ­ØµÙ Ø¹ÙÙ Ø±Ø§Ø¨Ø· ÙØ¤ÙØª ÙØ³ØªÙÙ.
+             * كل محاولة تحصل على رابط مؤقت مستقل.
              */
             const publicId =
                 "player_avatar_drafts/" +
@@ -1687,7 +1687,7 @@ app.post(
                         success: false,
 
                         message:
-                            "ÙÙ ÙØªÙ Ø¥ÙØ´Ø§Ø¡ Ø±Ø§Ø¨Ø· Ø§ÙØµÙØ±Ø©"
+                            "لم يتم إنشاء رابط الصورة"
                     });
             }
 
@@ -1711,17 +1711,17 @@ app.post(
                 );
 
             /*
-             * ÙØ§ ÙÙØ¬Ø¯ Ø£Ù Ø§Ø³ØªØ¯Ø¹Ø§Ø¡ PlayFab ÙØªØ­Ø¯ÙØ« Ø§ÙØµÙØ±Ø© ÙÙØ§.
+             * لا يوجد أي استدعاء PlayFab لتحديث الصورة هنا.
              *
-             * Unity ÙØ£Ø®Ø° avatarUrl Ù avatarVersion Ø«Ù ÙØ±Ø³ÙÙØ§ Ø¥ÙÙ:
+             * Unity يأخذ avatarUrl و avatarVersion ثم يرسلها إلى:
              * SaveProfileChangesWithRubies
              *
-             * CloudScript ÙÙ Ø§ÙÙØ³Ø¤ÙÙ Ø¹Ù:
-             * - Ø§ÙØªØ£ÙØ¯ ÙÙ Ø§ÙØ³Ø¹Ø±.
-             * - Ø®ØµÙ Ø§ÙÙØ§ÙÙØª.
-             * - Ø²ÙØ§Ø¯Ø© Ø§ÙØ¹Ø¯Ø§Ø¯.
-             * - Ø­ÙØ¸ avatar_url Ù avatar_version.
-             * - ØªØ­Ø¯ÙØ« UpdateAvatarUrl Ø§ÙØ±Ø³ÙÙ.
+             * CloudScript هو المسؤول عن:
+             * - التأكد من السعر.
+             * - خصم الياقوت.
+             * - زيادة العداد.
+             * - حفظ avatar_url و avatar_version.
+             * - تحديث UpdateAvatarUrl الرسمي.
              */
 
             console.log(
@@ -1740,7 +1740,7 @@ app.post(
                     success: true,
 
                     message:
-                        "ØªÙ Ø±ÙØ¹ Ø§ÙØµÙØ±Ø© ÙØ¤ÙØªÙØ§",
+                        "تم رفع الصورة مؤقتًا",
 
                     draft: true,
 
@@ -1798,7 +1798,7 @@ app.post(
                         error &&
                         error.message
                             ? error.message
-                            : "Ø­Ø¯Ø« Ø®Ø·Ø£ Ø£Ø«ÙØ§Ø¡ Ø±ÙØ¹ Ø§ÙØµÙØ±Ø©"
+                            : "حدث خطأ أثناء رفع الصورة"
                 });
         }
     }
@@ -1806,7 +1806,7 @@ app.post(
 
 
 // =====================================================
-// ÙØ¹Ø§ÙØ¬Ø© Ø£Ø®Ø·Ø§Ø¡ Ø±ÙØ¹ Ø§ÙØµÙØ±
+// معالجة أخطاء رفع الصور
 // =====================================================
 
 app.use(
@@ -1832,7 +1832,7 @@ app.use(
                         success: false,
 
                         message:
-                            "Ø­Ø¬Ù Ø§ÙØµÙØ±Ø© Ø£ÙØ¨Ø± ÙÙ 4 ÙÙØ¬Ø§Ø¨Ø§ÙØª"
+                            "حجم الصورة أكبر من 4 ميجابايت"
                     });
             }
 
@@ -1844,7 +1844,7 @@ app.use(
                     success: false,
 
                     message:
-                        "ÙØ´Ù Ø§Ø³ØªÙØ¨Ø§Ù Ø§ÙØµÙØ±Ø©"
+                        "فشل استقبال الصورة"
                 });
         }
 
@@ -1863,7 +1863,7 @@ app.use(
 
                     message:
                         error.message ||
-                        "Ø­Ø¯Ø« Ø®Ø·Ø£ Ø£Ø«ÙØ§Ø¡ Ø§Ø³ØªÙØ¨Ø§Ù Ø§ÙØ·ÙØ¨"
+                        "حدث خطأ أثناء استقبال الطلب"
                 });
         }
 
@@ -1889,3 +1889,4 @@ app.listen(
         );
     }
 );
+
