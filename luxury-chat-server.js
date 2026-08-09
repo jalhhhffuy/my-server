@@ -1,14 +1,14 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V11 FINAL HARDENED
+// Luxury Chat Server - V12 SEND RECOVERY HARDENED
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
 // IMAGE + VIDEO MODERATION: Amazon Rekognition via Cloudinary
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // BUILD:
-// 2026-08-10-LUXURY-CHAT-SERVER-V11-ADMIN-THROTTLE-CORRUPT-SHARD-IDEMPOTENT-MEDIA
+// 2026-08-10-LUXURY-CHAT-SERVER-V12-SEND-RECOVERY-NO-ADMIN-DEPENDENCY
 //
 // server.js:
 // const installLuxuryChat = require("./luxury-chat-server");
@@ -31,7 +31,7 @@
 // V10 يدعم أيضاً Buffer ويحاول JSON.stringify(req.body) كـ fallback آمن للتوقيع
 // إذا لم يكن rawBody متوفراً، لكنه لا يقبل Webhook غير موقع.
 //
-// أهم إصلاحات V11 فوق V10:
+// أهم إصلاحات V12 فوق V11:
 // - نفس نظام History shards الخاص بـV9 بدون Shared Overwrite.
 // - منع تراجع حالة الفيديو من approved/rejected إلى pending بسبب سباق Webhook/Upload callback.
 // - Cloudinary Admin API هو المرجع النهائي لحالة الفيديو متى أمكن.
@@ -48,6 +48,9 @@
 // - تخفيض ضغط Cloudinary Admin API: اكتشاف Shards على فترات، مع قراءة المحتوى من Delivery URL بين الاكتشافات.
 // - Shard فيديو تالف لا يعطل كل رفع/حالة الفيديو؛ يتم عزله، والمنتهي منه يحذف بأمان.
 // - Public ID حتمي للصوت/الصور/الفيديو عند وجود clientMessageId لمنع رفع أصلين لنفس Retry بين instances.
+// - الإرسال لا يتوقف إذا Cloudinary Admin API وصل Rate Limit أو تعطل مؤقتاً.
+// - قراءة Legacy history والـLocal writer shard تتم مباشرة من Delivery URL بدون Admin resource lookup.
+// - Force refresh يستخدم Runtime/Shard cache عند فشل المزامنة بدل إسقاط /chat/send بالكامل.
 // ============================================================================
 
 const multer = require("multer");
@@ -63,7 +66,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-10-LUXURY-CHAT-SERVER-V11-ADMIN-THROTTLE-CORRUPT-SHARD-IDEMPOTENT-MEDIA";
+    "2026-08-10-LUXURY-CHAT-SERVER-V12-SEND-RECOVERY-NO-ADMIN-DEPENDENCY";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -856,14 +859,31 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       (forceDiscovery && !room.loaded);
 
     if (shouldDiscover) {
-      const discovered = await listHistoryShardResources(room.id);
-      if (!room.knownShardResources) room.knownShardResources = new Map();
+      try {
+        const discovered = await listHistoryShardResources(room.id);
+        if (!room.knownShardResources) room.knownShardResources = new Map();
 
-      for (const resource of discovered) {
-        room.knownShardResources.set(resource.publicId, resource);
+        for (const resource of discovered) {
+          room.knownShardResources.set(resource.publicId, resource);
+        }
+
+        room.lastShardDiscoveryMs = current;
+      } catch (error) {
+        // Admin API محدود بالطلبات. فشل الاكتشاف لا يجوز أن يمنع الإرسال.
+        // نحتفظ بأي Shards معروفة ونحاول الاكتشاف مرة أخرى بعد فترة قصيرة.
+        room.lastShardDiscoveryMs = Math.max(
+          0,
+          current - HISTORY_SHARD_DISCOVERY_MS + 5000
+        );
+
+        console.warn("[LuxuryChat][HISTORY][ADMIN_DISCOVERY_FALLBACK]", {
+          room: room.id,
+          knownShards: room.knownShardResources
+            ? room.knownShardResources.size
+            : 0,
+          error: error && error.message ? error.message : error,
+        });
       }
-
-      room.lastShardDiscoveryMs = current;
     }
 
     return Array.from((room.knownShardResources || new Map()).values());
@@ -1186,50 +1206,29 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   async function loadLegacyHistoryDocument(room) {
     if (room.legacyMissingUntilMs > nowMs()) return null;
 
-    let resource;
-    try {
-      resource = await resolveRawResource(legacyHistoryPublicId(room.id));
-    } catch (error) {
-      if (room.legacyCache && room.legacyCache.document) {
-        return room.legacyCache.document;
-      }
-      throw error;
-    }
-
-    if (!resource.exists) {
-      room.legacyMissingUntilMs = nowMs() + 60 * 1000;
-      return room.legacyCache && room.legacyCache.document
-        ? room.legacyCache.document
-        : null;
-    }
-
-    if (
-      room.legacyCache &&
-      room.legacyCache.version === resource.version &&
-      room.legacyCache.document
-    ) {
-      return room.legacyCache.document;
-    }
+    const publicId = legacyHistoryPublicId(room.id);
+    const deliveryUrl = rawDeliveryUrl(publicId);
 
     try {
       const document = await fetchHistoryDocumentFromUrl(
         room.id,
-        resource.secureUrl
+        deliveryUrl
       );
 
       if (!document) {
+        room.legacyMissingUntilMs = nowMs() + 60 * 1000;
         return room.legacyCache && room.legacyCache.document
           ? room.legacyCache.document
           : null;
       }
 
-      document.storagePublicId = resource.publicId;
-      document.storageVersion = resource.version;
-      document.secureUrl = resource.secureUrl;
+      document.storagePublicId = publicId;
+      document.storageVersion = 0;
+      document.secureUrl = deliveryUrl;
 
       room.legacyCache = {
-        version: resource.version,
-        secureUrl: resource.secureUrl,
+        version: 0,
+        secureUrl: deliveryUrl,
         document,
       };
 
@@ -1242,7 +1241,14 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         });
         return room.legacyCache.document;
       }
-      throw error;
+
+      // Legacy ملف توافق فقط؛ عطله أو فساده لا يجوز أن يوقف الشات الحالي.
+      room.legacyMissingUntilMs = nowMs() + 60 * 1000;
+      console.warn("[LuxuryChat][HISTORY][LEGACY_SKIPPED]", {
+        room: room.id,
+        error: error && error.message ? error.message : error,
+      });
+      return null;
     }
   }
 
@@ -1363,18 +1369,23 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
         return room;
       } catch (error) {
-        if (force) throw error;
+        // V12: القراءة/الاكتشاف من Cloudinary لا يجوز أن يحول عطل خارجي مؤقت
+        // إلى منع كامل للإرسال. نستخدم Runtime cache (حتى لو كانت فارغة عند أول تشغيل)
+        // ونستمر بالمحاولة في الطلبات التالية. الكتابة نفسها ما زالت تُتحقق بعد الرفع.
+        console.warn("[LuxuryChat][HISTORY][SYNC][SEND_SAFE_FALLBACK]", {
+          room: room.id,
+          force: !!force,
+          loaded: !!room.loaded,
+          cachedMessages: Array.isArray(room.messages) ? room.messages.length : 0,
+          error: error && error.message ? error.message : error,
+        });
 
-        if (room.loaded) {
-          console.warn("[LuxuryChat][HISTORY][SYNC][CACHE_FALLBACK]", {
-            room: room.id,
-            error: error && error.message ? error.message : error,
-          });
-          room.lastStorageSyncMs = nowMs() - HISTORY_CACHE_SYNC_MS + 250;
-          return room;
-        }
-
-        throw error;
+        room.loaded = true;
+        room.lastStorageSyncMs = nowMs() - HISTORY_CACHE_SYNC_MS + 250;
+        pruneExpired(room);
+        dedupeClientMessages(room);
+        repairSequenceCollisions(room);
+        return room;
       } finally {
         room.syncPromise = null;
       }
@@ -1459,7 +1470,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     repairSequenceCollisions(tempRoom);
 
     return {
-      version: 11,
+      version: 12,
       build: SERVER_BUILD,
       storageMode: "render-process-daily-shard",
       room: cleanRoom(roomId),
@@ -1485,16 +1496,19 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       };
     }
 
-    const resource = await resolveRawResource(publicId);
+    // Writer shard الخاص بهذه العملية معروف Public ID مسبقاً؛
+    // لا نحتاج Admin API لمعرفة هل هو موجود أم لا.
+    const deliveryUrl = rawDeliveryUrl(publicId);
+    const document = await fetchHistoryDocumentFromUrl(room.id, deliveryUrl);
 
-    if (!resource.exists) {
+    if (!document) {
       return {
         publicId,
         version: 0,
-        secureUrl: "",
+        secureUrl: deliveryUrl,
         document: {
           exists: true,
-          version: 11,
+          version: 12,
           room: room.id,
           seq: 0,
           retentionDays: RETENTION_DAYS,
@@ -1504,23 +1518,20 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       };
     }
 
-    const document = await fetchHistoryDocumentFromUrl(room.id, resource.secureUrl);
-    if (!document) throw new Error("local_history_shard_not_readable");
-
     document.storagePublicId = publicId;
-    document.storageVersion = resource.version;
-    document.secureUrl = resource.secureUrl;
+    document.storageVersion = 0;
+    document.secureUrl = deliveryUrl;
 
     room.shardCache.set(publicId, {
-      version: resource.version,
-      secureUrl: resource.secureUrl,
+      version: 0,
+      secureUrl: deliveryUrl,
       document,
     });
 
     return {
       publicId,
-      version: resource.version,
-      secureUrl: resource.secureUrl,
+      version: 0,
+      secureUrl: deliveryUrl,
       document,
     };
   }
@@ -2064,11 +2075,23 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       (forceDiscovery && !videoJobsLoaded);
 
     if (shouldDiscover) {
-      const discovered = await listVideoJobShardResources();
-      for (const resource of discovered) {
-        videoJobKnownResources.set(resource.publicId, resource);
+      try {
+        const discovered = await listVideoJobShardResources();
+        for (const resource of discovered) {
+          videoJobKnownResources.set(resource.publicId, resource);
+        }
+        lastVideoJobShardDiscoveryUnixMs = current;
+      } catch (error) {
+        // مثل History: Rate Limit في Admin API لا يجوز أن يمنع رفع فيديو جديد.
+        lastVideoJobShardDiscoveryUnixMs = Math.max(
+          0,
+          current - VIDEO_JOB_SHARD_DISCOVERY_MS + 5000
+        );
+        console.warn("[LuxuryChat][VIDEO_JOBS][ADMIN_DISCOVERY_FALLBACK]", {
+          knownShards: videoJobKnownResources.size,
+          error: error && error.message ? error.message : error,
+        });
       }
-      lastVideoJobShardDiscoveryUnixMs = current;
     }
 
     return Array.from(videoJobKnownResources.values());
@@ -2255,14 +2278,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     }
 
     // V8 القديم: قراءة فقط للتوافق مع Pending videos القديمة.
+    // ملف Legacy لا يجوز أن يعطل نظام الفيديو الحديث إذا كان تالفاً أو غير متاح.
     try {
       const legacy = await readEncryptedVideoJobsUrl(legacyVideoJobsUrl());
       if (legacy) {
         for (const job of legacy) mergeVideoJob(job);
       }
     } catch (error) {
-      if (!videoJobsLoaded) throw error;
-
       console.warn(
         "[LuxuryChat][VIDEO_JOBS][LEGACY_READ_SKIPPED]",
         error && error.message ? error.message : error
@@ -2323,7 +2345,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     const publicId = videoJobsShardPublicId(dayKey);
 
     const payload = {
-      version: 11,
+      version: 12,
       build: SERVER_BUILD,
       storageMode: "render-process-daily-video-job-shard",
       shardDay: dayKey,
@@ -3177,7 +3199,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     let adminResource = null;
     let adminStatus = "";
 
-    // V11: نسأل Cloudinary Admin API كلما طبقنا نتيجة نهائية؛ هو المرجع الأقوى.
+    // V12: نسأل Cloudinary Admin API لحالة الفيديو النهائية متى أمكن؛ فشلها لا يمنع fallback الموقع.
     try {
       adminResource = await getVideoModerationResource(id);
       job.lastCloudinaryCheckUnixMs = nowMs();
@@ -3219,7 +3241,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       return { status: "rejected" };
     }
 
-    // أهم إصلاح سباق V11: pending لا يستطيع إنزال حالة نهائية سابقة.
+    // أهم إصلاح سباق V12: pending لا يستطيع إنزال حالة نهائية سابقة.
     if (isTerminalVideoStatus(previousStatus)) {
       job.status = previousStatus;
       job.moderationStatus = previousModerationStatus;
@@ -3610,7 +3632,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         serverLatestSeq: Math.max(0, Number(room.seq) || 0),
         hasMore: window.hasMore,
         retentionDays: RETENTION_DAYS,
-        source: "cloudinary-sharded-v10-strict-window",
+        source: "cloudinary-sharded-v12-send-recovery-window",
         build: SERVER_BUILD,
       });
     } catch (error) {
@@ -4461,7 +4483,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   console.log("[LuxuryChat] installed", {
-    version: 11,
+    version: 12,
     build: SERVER_BUILD,
     imageModeration: IMAGE_MODERATION_KIND,
     imageModerationFailClosed: true,
@@ -4472,7 +4494,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     persistentHistory:
       "Cloudinary raw JSON - per-process daily shards + strict full snapshots",
     historyCacheRole:
-      "runtime cache + throttled Admin discovery + direct raw delivery refresh",
+      "runtime cache + throttled Admin discovery + send-safe fallback + direct raw delivery refresh",
     historyShardDiscoveryMs: HISTORY_SHARD_DISCOVERY_MS,
     videoJobShardDiscoveryMs: VIDEO_JOB_SHARD_DISCOVERY_MS,
     deterministicMediaPublicIds: true,
