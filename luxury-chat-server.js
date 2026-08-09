@@ -1,8 +1,9 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V3
+// Luxury Chat Server - V4
 // Persistent 30 Days + Text + Voice + Image + Video + Reports + Avatar/Profile
+// IMAGE MODERATION STEP 1: Amazon Rekognition AI Moderation via Cloudinary
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // server.js:
@@ -23,6 +24,11 @@
 // - History يرجع بحد أقصى 100 رسالة في الطلب الواحد.
 // - يدعم text / voice / image / video.
 // - الصور والفيديوهات والملاحظات الصوتية ترفع إلى Cloudinary.
+// - صور الشات تمر على Amazon Rekognition AI Moderation قبل نشرها.
+// - الصورة لا تدخل تاريخ الشات إلا إذا كانت حالة aws_rek = approved.
+// - الصورة المرفوضة أو التي لم يكتمل فحصها لا تنشر في الشات.
+// - نحاول حذف الصورة المرفوضة/غير المعتمدة من Cloudinary مباشرة.
+// - الفيديو في هذه النسخة ما زال يعمل بالنظام السابق، وسيضاف له Webhook في الخطوة التالية.
 // - البلاغات تحفظ في PlayFab Title Internal Data.
 // - كل رسالة تحمل اسم اللاعب + رابط صورته + نسخة الصورة.
 // - بيانات البروفايل تُقرأ حديثة عند الإرسال حتى يظهر تغيير الاسم/الصورة بسرعة.
@@ -69,6 +75,20 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   const VOICE_FOLDER = "chat_voice_notes";
   const IMAGE_FOLDER = "chat_media_images";
   const VIDEO_FOLDER = "chat_media_videos";
+
+  // Amazon Rekognition AI Moderation للصور.
+  // نستخدم الإعداد الافتراضي من Cloudinary:
+  // إذا تجاوزت أي فئة حد الثقة الافتراضي، تصبح الصورة rejected.
+  const IMAGE_MODERATION_KIND = "aws_rek";
+
+  // أنواع الصور التي نسمح بها فعليًا من Unity.
+  // يمنع تمرير ملفات غريبة تحت image/*.
+  const ALLOWED_IMAGE_MIME_TYPES = new Set([
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+  ]);
 
   // ==========================================================================
   // MULTER
@@ -190,6 +210,17 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       .slice(0, 80);
 
     return `${base || "media"}${ext.toLowerCase()}`;
+  }
+
+  function makeChatError(code, message, extra) {
+    const error = new Error(message || code || "chat_error");
+    error.code = code || "CHAT_ERROR";
+
+    if (extra && typeof extra === "object") {
+      Object.assign(error, extra);
+    }
+
+    return error;
   }
 
   // ==========================================================================
@@ -557,7 +588,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     pruneExpired(room);
 
     await uploadRawJson(historyPublicId(roomId), {
-      version: 3,
+      version: 4,
       room: cleanRoom(roomId),
       seq: Math.max(0, Number(room.seq) || 0),
       retentionDays: RETENTION_DAYS,
@@ -722,6 +753,81 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       .toString("hex")}`;
   }
 
+  function getModerationEntry(uploadResult, kind) {
+    const moderation =
+      uploadResult && Array.isArray(uploadResult.moderation)
+        ? uploadResult.moderation
+        : [];
+
+    for (const item of moderation) {
+      if (!item || typeof item !== "object") continue;
+
+      if (
+        String(item.kind || "")
+          .trim()
+          .toLowerCase() === String(kind || "").trim().toLowerCase()
+      ) {
+        return item;
+      }
+    }
+
+    return null;
+  }
+
+  function getModerationStatus(uploadResult, kind) {
+    const entry = getModerationEntry(uploadResult, kind);
+
+    return entry
+      ? String(entry.status || "")
+          .trim()
+          .toLowerCase()
+      : "";
+  }
+
+  function getModerationLabels(uploadResult, kind) {
+    const entry = getModerationEntry(uploadResult, kind);
+
+    if (
+      !entry ||
+      !entry.response ||
+      !Array.isArray(entry.response.moderation_labels)
+    ) {
+      return [];
+    }
+
+    // لا نعيدها إلى Unity. نستخدمها فقط للـLogs الداخلية.
+    return entry.response.moderation_labels.slice(0, 20);
+  }
+
+  async function destroyCloudinaryAsset(publicId, resourceType) {
+    const id = safeString(publicId, 500);
+    if (!id) return false;
+
+    try {
+      const result = await cloudinary.uploader.destroy(id, {
+        resource_type: resourceType || "image",
+        type: "upload",
+        invalidate: true,
+      });
+
+      console.log("[LuxuryChat][CLOUDINARY][DESTROY]", {
+        publicId: id,
+        resourceType: resourceType || "image",
+        result: result && result.result ? result.result : result,
+      });
+
+      return true;
+    } catch (error) {
+      console.error("[LuxuryChat][CLOUDINARY][DESTROY][FAILED]", {
+        publicId: id,
+        resourceType: resourceType || "image",
+        error: error && error.message ? error.message : error,
+      });
+
+      return false;
+    }
+  }
+
   function uploadAudioBuffer(buffer, playFabId) {
     return new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
@@ -749,6 +855,15 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     });
   }
 
+  // ==========================================================================
+  // IMAGE UPLOAD + AMAZON REKOGNITION MODERATION
+  //
+  // مهم:
+  // - لا نثق بمجرد نجاح الرفع.
+  // - لا نرجع URL ولا ننشر رسالة إلا إذا aws_rek = approved.
+  // - rejected / pending / missing = رفض مغلق Fail Closed.
+  // ==========================================================================
+
   function uploadImageBuffer(buffer, playFabId) {
     return new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
@@ -758,12 +873,78 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           public_id: uniqueMediaPublicId(playFabId),
           overwrite: false,
           format: "jpg",
-        },
-        (error, result) => {
-          if (error) return reject(error);
 
-          if (!result || !result.secure_url) {
-            return reject(new Error("cloudinary_no_url"));
+          // هذه هي حماية الصور:
+          moderation: IMAGE_MODERATION_KIND,
+        },
+        async (error, result) => {
+          if (error) {
+            return reject(error);
+          }
+
+          if (!result || !result.public_id) {
+            return reject(
+              makeChatError(
+                "IMAGE_UPLOAD_NO_RESULT",
+                "cloudinary_image_no_result"
+              )
+            );
+          }
+
+          const publicId = safeString(result.public_id, 500);
+          const moderationStatus = getModerationStatus(
+            result,
+            IMAGE_MODERATION_KIND
+          );
+
+          const moderationLabels = getModerationLabels(
+            result,
+            IMAGE_MODERATION_KIND
+          );
+
+          console.log("[LuxuryChat][IMAGE_MODERATION]", {
+            playFabId: safeString(playFabId, 100),
+            publicId,
+            status: moderationStatus || "missing",
+            labelsCount: moderationLabels.length,
+          });
+
+          // لا نعتمد الصورة إلا عند approved بشكل صريح.
+          if (moderationStatus !== "approved") {
+            await destroyCloudinaryAsset(publicId, "image");
+
+            if (moderationStatus === "rejected") {
+              return reject(
+                makeChatError(
+                  "IMAGE_MODERATION_REJECTED",
+                  "image_moderation_rejected",
+                  {
+                    moderationStatus,
+                  }
+                )
+              );
+            }
+
+            return reject(
+              makeChatError(
+                "IMAGE_MODERATION_NOT_APPROVED",
+                "image_moderation_not_approved",
+                {
+                  moderationStatus: moderationStatus || "missing",
+                }
+              )
+            );
+          }
+
+          if (!result.secure_url) {
+            await destroyCloudinaryAsset(publicId, "image");
+
+            return reject(
+              makeChatError(
+                "IMAGE_UPLOAD_NO_URL",
+                "cloudinary_image_no_url"
+              )
+            );
           }
 
           const thumb = cloudinary.url(result.public_id, {
@@ -784,7 +965,8 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           resolve({
             url: result.secure_url,
             thumbnailUrl: thumb || result.secure_url,
-            publicId: result.public_id || "",
+            publicId,
+            moderationStatus,
           });
         }
       );
@@ -792,6 +974,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       stream.end(buffer);
     });
   }
+
+  // ==========================================================================
+  // VIDEO UPLOAD
+  //
+  // هذه النسخة تبقي الفيديو بالنظام السابق فقط.
+  // سنضيف aws_rek_video + pending + webhook في الخطوة التالية.
+  // ==========================================================================
 
   function uploadVideoBuffer(buffer, playFabId) {
     return new Promise((resolve, reject) => {
@@ -1269,10 +1458,10 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         const fileSize = Number(req.file.size || req.file.buffer.length || 0);
 
         if (requestedType === "image") {
-          if (!mime.startsWith("image/")) {
+          if (!ALLOWED_IMAGE_MIME_TYPES.has(mime)) {
             return res.status(400).json({
               ok: false,
-              error: "الملف المختار ليس صورة",
+              error: "نوع الصورة غير مدعوم. استخدم JPG أو PNG أو WEBP",
             });
           }
 
@@ -1335,9 +1524,29 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         let uploaded;
 
         if (requestedType === "image") {
+          // uploadImageBuffer لن يرجع نجاح إلا عند approved.
           uploaded = await uploadImageBuffer(req.file.buffer, playFabId);
         } else {
           uploaded = await uploadVideoBuffer(req.file.buffer, playFabId);
+        }
+
+        // حماية إضافية:
+        // حتى لو تغير uploadImageBuffer لاحقًا بالخطأ، لا ننشر صورة
+        // بدون approved صريح.
+        if (
+          requestedType === "image" &&
+          String(uploaded && uploaded.moderationStatus || "")
+            .trim()
+            .toLowerCase() !== "approved"
+        ) {
+          if (uploaded && uploaded.publicId) {
+            await destroyCloudinaryAsset(uploaded.publicId, "image");
+          }
+
+          return res.status(503).json({
+            ok: false,
+            error: "تعذر اعتماد الصورة من نظام الحماية، حاول مرة أخرى",
+          });
         }
 
         const message = makeMessage({
@@ -1357,6 +1566,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           requestedType === "image" ? "chat_image.jpg" : "chat_video.mp4"
         );
 
+        // لا تصل الصورة إلى هنا إلا بعد approved.
         await pushMessage(roomId, message);
 
         res.json({
@@ -1365,6 +1575,35 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         });
       } catch (error) {
         console.error("/chat/media", error);
+
+        // رفض محتوى الصورة من Amazon Rekognition.
+        if (error && error.code === "IMAGE_MODERATION_REJECTED") {
+          return res.status(422).json({
+            ok: false,
+            moderationRejected: true,
+            error: "تم رفض الصورة لأنها تخالف قوانين الشات",
+          });
+        }
+
+        // الحماية لم ترجع approved: لا ننشر الصورة احتياطًا.
+        if (error && error.code === "IMAGE_MODERATION_NOT_APPROVED") {
+          return res.status(503).json({
+            ok: false,
+            moderationRejected: false,
+            error: "تعذر فحص الصورة الآن، حاول مرة أخرى بعد قليل",
+          });
+        }
+
+        if (
+          error &&
+          (error.code === "IMAGE_UPLOAD_NO_RESULT" ||
+            error.code === "IMAGE_UPLOAD_NO_URL")
+        ) {
+          return res.status(502).json({
+            ok: false,
+            error: "تعذر اعتماد الصورة بعد رفعها",
+          });
+        }
 
         res.status(500).json({
           ok: false,
@@ -1471,7 +1710,10 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ==========================================================================
 
   console.log("[LuxuryChat] installed", {
-    version: 3,
+    version: 4,
+    imageModeration: IMAGE_MODERATION_KIND,
+    imageModerationFailClosed: true,
+    videoModeration: "not-yet-enabled-step-2",
     persistentHistory: "Cloudinary raw JSON",
     retentionDays: RETENTION_DAYS,
     fetchLimit: MAX_FETCH_LIMIT,
@@ -1489,3 +1731,4 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     ],
   });
 };
+
