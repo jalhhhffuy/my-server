@@ -34,6 +34,129 @@ cloudinary.config({
 
 
 // =====================================================
+// Avatar Image Moderation
+// Amazon Rekognition AI Moderation
+//
+// السلوك:
+// - صورة الملف الشخصي ترفع كمسودة فقط.
+// - Cloudinary يفحصها بواسطة aws_rek أثناء الرفع.
+// - لا يرجع avatarUrl إلى Unity إلا إذا الحالة approved.
+// - rejected تُحذف مباشرة من Cloudinary.
+// - pending / missing / أي حالة غير approved تُرفض احتياطياً.
+// =====================================================
+
+const AVATAR_IMAGE_MODERATION_KIND =
+    "aws_rek";
+
+
+function getCloudinaryModerationStatus(
+    uploadResult,
+    kind
+) {
+    const moderation =
+        uploadResult &&
+        Array.isArray(
+            uploadResult.moderation
+        )
+            ? uploadResult.moderation
+            : [];
+
+    const wantedKind =
+        String(
+            kind || ""
+        )
+            .trim()
+            .toLowerCase();
+
+    for (
+        const item
+        of moderation
+    ) {
+        if (
+            !item ||
+            typeof item !== "object"
+        ) {
+            continue;
+        }
+
+        const itemKind =
+            String(
+                item.kind || ""
+            )
+                .trim()
+                .toLowerCase();
+
+        if (
+            itemKind ===
+            wantedKind
+        ) {
+            return String(
+                item.status || ""
+            )
+                .trim()
+                .toLowerCase();
+        }
+    }
+
+    return "";
+}
+
+
+async function deleteCloudinaryImage(
+    publicId
+) {
+    const id =
+        String(
+            publicId || ""
+        ).trim();
+
+    if (!id) {
+        return false;
+    }
+
+    try {
+        const result =
+            await cloudinary.uploader.destroy(
+                id,
+                {
+                    resource_type:
+                        "image",
+
+                    type:
+                        "upload",
+
+                    invalidate:
+                        true
+                }
+            );
+
+        console.log(
+            "CLOUDINARY IMAGE DELETE:",
+            id,
+            result &&
+            result.result
+                ? result.result
+                : result
+        );
+
+        return true;
+    }
+    catch (error) {
+        console.log(
+            "CLOUDINARY IMAGE DELETE ERROR:",
+            id,
+            error &&
+            error.message
+                ? error.message
+                : error
+        );
+
+        return false;
+    }
+}
+
+
+// =====================================================
 // Luxury Global Chat
 // =====================================================
 
@@ -1450,6 +1573,7 @@ app.get(
 // مهم:
 // - يتحقق من جلسة PlayFab.
 // - يرفع الصورة إلى Cloudinary فقط.
+// - يفحص الصورة عبر Amazon Rekognition قبل إرجاع الرابط.
 // - لا يحفظ رابط الصورة في PlayFab.
 // - لا يستدعي UpdateAvatarUrl.
 // - لا يستدعي UpdateUserData.
@@ -1633,6 +1757,10 @@ app.post(
                                         format:
                                             "jpg",
 
+                                        // حماية صورة الملف الشخصي.
+                                        moderation:
+                                            AVATAR_IMAGE_MODERATION_KIND,
+
                                         transformation: [
                                             {
                                                 width: 512,
@@ -1677,8 +1805,99 @@ app.post(
 
             if (
                 !uploadResult ||
+                !uploadResult.public_id
+            ) {
+                return res
+                    .status(500)
+                    .json({
+                        ok: false,
+
+                        success: false,
+
+                        message:
+                            "لم يتم إنشاء الصورة على Cloudinary"
+                    });
+            }
+
+            const uploadedPublicId =
+                String(
+                    uploadResult.public_id
+                ).trim();
+
+            const moderationStatus =
+                getCloudinaryModerationStatus(
+                    uploadResult,
+                    AVATAR_IMAGE_MODERATION_KIND
+                );
+
+            console.log(
+                "AVATAR MODERATION:",
+                playFabId,
+                uploadedPublicId,
+                moderationStatus ||
+                    "missing"
+            );
+
+            /*
+             * Fail Closed:
+             * لا نعتمد الصورة إلا عند approved بشكل صريح.
+             */
+            if (
+                moderationStatus !==
+                "approved"
+            ) {
+                await deleteCloudinaryImage(
+                    uploadedPublicId
+                );
+
+                if (
+                    moderationStatus ===
+                    "rejected"
+                ) {
+                    return res
+                        .status(422)
+                        .json({
+                            ok: false,
+
+                            success: false,
+
+                            moderationRejected:
+                                true,
+
+                            moderationStatus:
+                                "rejected",
+
+                            message:
+                                "تم رفض الصورة لأنها تخالف قوانين الصور"
+                        });
+                }
+
+                return res
+                    .status(503)
+                    .json({
+                        ok: false,
+
+                        success: false,
+
+                        moderationRejected:
+                            false,
+
+                        moderationStatus:
+                            moderationStatus ||
+                            "missing",
+
+                        message:
+                            "تعذر فحص الصورة الآن، حاول مرة أخرى بعد قليل"
+                    });
+            }
+
+            if (
                 !uploadResult.secure_url
             ) {
+                await deleteCloudinaryImage(
+                    uploadedPublicId
+                );
+
                 return res
                     .status(500)
                     .json({
@@ -1713,7 +1932,8 @@ app.post(
             /*
              * لا يوجد أي استدعاء PlayFab لتحديث الصورة هنا.
              *
-             * Unity يأخذ avatarUrl و avatarVersion ثم يرسلها إلى:
+             * Unity يأخذ avatarUrl و avatarVersion فقط بعد approved
+             * ثم يرسلها إلى:
              * SaveProfileChangesWithRubies
              *
              * CloudScript هو المسؤول عن:
@@ -1725,7 +1945,7 @@ app.post(
              */
 
             console.log(
-                "AVATAR DRAFT UPLOADED:",
+                "AVATAR DRAFT APPROVED AND UPLOADED:",
                 playFabId,
                 draftId,
                 avatarVersion,
@@ -1744,6 +1964,12 @@ app.post(
 
                     draft: true,
 
+                    moderationApproved:
+                        true,
+
+                    moderationStatus:
+                        "approved",
+
                     playFabId:
                         playFabId,
 
@@ -1754,7 +1980,7 @@ app.post(
                         draftId,
 
                     draftPublicId:
-                        publicId,
+                        uploadedPublicId,
 
                     avatarUrl:
                         avatarUrl,
@@ -1787,6 +2013,10 @@ app.post(
                 error
             );
 
+            /*
+             * إذا Cloudinary نفسه رجع خطأ من خدمة moderation
+             * لا نعتبر الصورة ناجحة ولا نحفظ أي رابط.
+             */
             return res
                 .status(500)
                 .json({
@@ -1795,10 +2025,7 @@ app.post(
                     success: false,
 
                     message:
-                        error &&
-                        error.message
-                            ? error.message
-                            : "حدث خطأ أثناء رفع الصورة"
+                        "تعذر رفع أو فحص الصورة، حاول مرة أخرى"
                 });
         }
     }
