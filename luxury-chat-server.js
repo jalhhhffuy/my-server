@@ -1,9 +1,9 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V4
+// Luxury Chat Server - V5
 // Persistent 30 Days + Text + Voice + Image + Video + Reports + Avatar/Profile
-// IMAGE MODERATION STEP 1: Amazon Rekognition AI Moderation via Cloudinary
+// IMAGE + VIDEO MODERATION: Amazon Rekognition via Cloudinary
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // server.js:
@@ -28,7 +28,11 @@
 // - الصورة لا تدخل تاريخ الشات إلا إذا كانت حالة aws_rek = approved.
 // - الصورة المرفوضة أو التي لم يكتمل فحصها لا تنشر في الشات.
 // - نحاول حذف الصورة المرفوضة/غير المعتمدة من Cloudinary مباشرة.
-// - الفيديو في هذه النسخة ما زال يعمل بالنظام السابق، وسيضاف له Webhook في الخطوة التالية.
+// - الفيديو يرفع أولاً كملف Pending ولا يدخل تاريخ الشات قبل الموافقة.
+// - فيديوهات الشات تمر على Amazon Rekognition Video Moderation (aws_rek_video).
+// - Cloudinary يرسل نتيجة الفيديو إلى Webhook موقع ومتحقق منه.
+// - approved: ينشئ السيرفر رسالة الفيديو الحقيقية ويضيفها للشات.
+// - rejected: يحذف السيرفر الفيديو ويحفظ حالة الرفض مؤقتاً حتى يعرف Unity النتيجة.
 // - البلاغات تحفظ في PlayFab Title Internal Data.
 // - كل رسالة تحمل اسم اللاعب + رابط صورته + نسخة الصورة.
 // - بيانات البروفايل تُقرأ حديثة عند الإرسال حتى يظهر تغيير الاسم/الصورة بسرعة.
@@ -80,6 +84,46 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // نستخدم الإعداد الافتراضي من Cloudinary:
   // إذا تجاوزت أي فئة حد الثقة الافتراضي، تصبح الصورة rejected.
   const IMAGE_MODERATION_KIND = "aws_rek";
+
+  // Amazon Rekognition Video Moderation.
+  const VIDEO_MODERATION_KIND = "aws_rek_video";
+
+  // رابط السيرفر العام المستخدم في notification_url.
+  const PUBLIC_SERVER_URL =
+    String(
+      process.env.CHAT_PUBLIC_SERVER_URL ||
+        process.env.PUBLIC_SERVER_URL ||
+        "https://my-server-i40i.onrender.com"
+    )
+      .trim()
+      .replace(/\/+$/, "");
+
+  const VIDEO_MODERATION_WEBHOOK_PATH =
+    "/chat/video-moderation-webhook";
+
+  const VIDEO_MODERATION_WEBHOOK_URL =
+    `${PUBLIC_SERVER_URL}${VIDEO_MODERATION_WEBHOOK_PATH}`;
+
+  // ملف داخلي مشفر لحالات الفيديو المعلقة حتى لا تضيع عند Restart في Render.
+  const VIDEO_JOBS_PUBLIC_ID =
+    "luxury_chat_video_pending/video_jobs_v1.json";
+
+  // نحتفظ بنتائج pending/rejected/approved مؤقتاً حتى Unity يقدر يسأل عن الحالة.
+  const VIDEO_JOB_RETENTION_MS =
+    24 * 60 * 60 * 1000;
+
+  // توقيع Cloudinary Webhook يحتاج API secret على السيرفر فقط.
+  const CLOUDINARY_API_SECRET =
+    String(process.env.CLOUDINARY_API_SECRET || "").trim();
+
+  // نقبل Webhook حديث فقط. Cloudinary نفسه يوصي بفحص حد زمني معقول.
+  const CLOUDINARY_WEBHOOK_MAX_AGE_SECONDS =
+    2 * 60 * 60;
+
+  // /chat/video-status لا يضرب Admin API مع كل Poll.
+  // الـWebhook هو الأساس، وهذا فحص احتياطي فقط كل 30 ثانية لكل فيديو.
+  const VIDEO_STATUS_FALLBACK_CHECK_MS =
+    30 * 1000;
 
   // أنواع الصور التي نسمح بها فعليًا من Unity.
   // يمنع تمرير ملفات غريبة تحت image/*.
@@ -141,6 +185,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   let reports = [];
   let reportsLoadPromise = null;
   let reportsWriteChain = Promise.resolve();
+
+
+  // Video moderation jobs.
+  const videoJobs = new Map();
+  let videoJobsLoaded = false;
+  let videoJobsLoadPromise = null;
+  let videoJobsWriteChain = Promise.resolve();
 
   // ==========================================================================
   // BASIC HELPERS
@@ -424,6 +475,760 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     });
   }
 
+
+  // ==========================================================================
+  // VIDEO MODERATION JOB PERSISTENCE
+  //
+  // نحفظ jobs في Cloudinary Raw JSON ولكن المحتوى نفسه AES-256-GCM مشفر.
+  // هذا يمنع ظهور PlayFabId / reply snapshot / URLs كنص واضح لو عُرف رابط الملف.
+  // ==========================================================================
+
+  function videoJobsUrl() {
+    const base = cloudinary.url(VIDEO_JOBS_PUBLIC_ID, {
+      resource_type: "raw",
+      type: "upload",
+      secure: true,
+    });
+
+    return `${base}${base.includes("?") ? "&" : "?"}ts=${nowMs()}`;
+  }
+
+  function getVideoJobsCryptoKey() {
+    if (!CLOUDINARY_API_SECRET) {
+      throw new Error("CLOUDINARY_API_SECRET missing for video jobs encryption");
+    }
+
+    return crypto
+      .createHash("sha256")
+      .update(
+        `luxury-chat-video-jobs-v1|${CLOUDINARY_API_SECRET}`,
+        "utf8"
+      )
+      .digest();
+  }
+
+  function encryptVideoJobsPayload(object) {
+    const iv = crypto.randomBytes(12);
+    const key = getVideoJobsCryptoKey();
+    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+
+    const plain = Buffer.from(JSON.stringify(object), "utf8");
+    const encrypted = Buffer.concat([
+      cipher.update(plain),
+      cipher.final(),
+    ]);
+
+    const tag = cipher.getAuthTag();
+
+    return {
+      version: 1,
+      algorithm: "aes-256-gcm",
+      iv: iv.toString("base64"),
+      tag: tag.toString("base64"),
+      data: encrypted.toString("base64"),
+    };
+  }
+
+  function decryptVideoJobsPayload(envelope) {
+    if (
+      !envelope ||
+      typeof envelope !== "object" ||
+      envelope.algorithm !== "aes-256-gcm" ||
+      !envelope.iv ||
+      !envelope.tag ||
+      !envelope.data
+    ) {
+      throw new Error("video_jobs_invalid_envelope");
+    }
+
+    const key = getVideoJobsCryptoKey();
+    const iv = Buffer.from(String(envelope.iv), "base64");
+    const tag = Buffer.from(String(envelope.tag), "base64");
+    const encrypted = Buffer.from(String(envelope.data), "base64");
+
+    const decipher = crypto.createDecipheriv(
+      "aes-256-gcm",
+      key,
+      iv
+    );
+
+    decipher.setAuthTag(tag);
+
+    const plain = Buffer.concat([
+      decipher.update(encrypted),
+      decipher.final(),
+    ]).toString("utf8");
+
+    return JSON.parse(plain);
+  }
+
+  function normalizeVideoJob(raw) {
+    if (!raw || typeof raw !== "object") return null;
+
+    const jobId = safeString(raw.jobId, 100);
+    const publicId = safeString(raw.publicId, 500);
+    const senderId = safeString(raw.senderId, 100);
+    const roomId = cleanRoom(raw.roomId || raw.room || "global");
+    const clientMessageId = cleanClientMessageId(raw.clientMessageId);
+
+    if (!jobId || !publicId || !senderId || !clientMessageId) {
+      return null;
+    }
+
+    const profileRaw =
+      raw.profile && typeof raw.profile === "object"
+        ? raw.profile
+        : {};
+
+    const replyRaw =
+      raw.reply && typeof raw.reply === "object"
+        ? raw.reply
+        : {};
+
+    return {
+      jobId,
+      publicId,
+      senderId,
+      roomId,
+      clientMessageId,
+
+      status: safeString(raw.status, 30) || "pending",
+      moderationStatus:
+        safeString(raw.moderationStatus, 30) || "pending",
+
+      createdAtUnixMs:
+        Math.max(0, Number(raw.createdAtUnixMs) || 0) || nowMs(),
+
+      updatedAtUnixMs:
+        Math.max(0, Number(raw.updatedAtUnixMs) || 0) || nowMs(),
+
+      uploadCompleted: !!raw.uploadCompleted,
+
+      lastCloudinaryCheckUnixMs:
+        Math.max(0, Number(raw.lastCloudinaryCheckUnixMs) || 0),
+
+      mediaUrl: safeString(raw.mediaUrl, 1600),
+      mediaThumbnailUrl:
+        safeString(raw.mediaThumbnailUrl, 1600),
+
+      mediaFileName:
+        safeString(raw.mediaFileName, 180) || "chat_video.mp4",
+
+      rejectReason:
+        safeString(raw.rejectReason, 300),
+
+      messageId:
+        safeString(raw.messageId, 100),
+
+      profile: {
+        playerName:
+          safeString(profileRaw.playerName, 64) || "لاعب",
+
+        avatarUrl:
+          safeString(profileRaw.avatarUrl, 1000),
+
+        avatarVersion:
+          safeString(profileRaw.avatarVersion, 100) || "0",
+      },
+
+      reply: {
+        replyToId:
+          safeString(replyRaw.replyToId, 100),
+
+        replyToName:
+          safeString(replyRaw.replyToName, 64),
+
+        replyToPreview:
+          safeString(replyRaw.replyToPreview, 120),
+      },
+    };
+  }
+
+  function pruneVideoJobsInMemory() {
+    const cutoff = nowMs() - VIDEO_JOB_RETENTION_MS;
+    let changed = false;
+
+    for (const [publicId, job] of videoJobs.entries()) {
+      if (!job) {
+        videoJobs.delete(publicId);
+        changed = true;
+        continue;
+      }
+
+      const updated =
+        Math.max(0, Number(job.updatedAtUnixMs) || 0);
+
+      // فقط النتائج النهائية القديمة نحذف سجلها.
+      // pending لا نحذفه هنا حتى لا نفقد نتيجة Webhook متأخرة.
+      if (
+        updated > 0 &&
+        updated <= cutoff &&
+        (job.status === "approved" ||
+          job.status === "rejected" ||
+          job.status === "failed")
+      ) {
+        videoJobs.delete(publicId);
+        changed = true;
+      }
+    }
+
+    return changed;
+  }
+
+  async function loadVideoJobsFromStorage() {
+    const response = await fetch(videoJobsUrl(), {
+      method: "GET",
+      headers: {
+        "Cache-Control": "no-cache, no-store",
+        Pragma: "no-cache",
+      },
+    });
+
+    if (response.status === 404) {
+      videoJobs.clear();
+      videoJobsLoaded = true;
+      return videoJobs;
+    }
+
+    if (!response.ok) {
+      throw new Error(`video_jobs_load_http_${response.status}`);
+    }
+
+    const text = await response.text();
+
+    let envelope;
+
+    try {
+      envelope = JSON.parse(text);
+    } catch (_) {
+      throw new Error("video_jobs_invalid_json");
+    }
+
+    const decoded = decryptVideoJobsPayload(envelope);
+
+    const source =
+      decoded && Array.isArray(decoded.jobs)
+        ? decoded.jobs
+        : [];
+
+    videoJobs.clear();
+
+    for (const raw of source) {
+      const job = normalizeVideoJob(raw);
+      if (!job) continue;
+
+      videoJobs.set(job.publicId, job);
+    }
+
+    videoJobsLoaded = true;
+
+    if (pruneVideoJobsInMemory()) {
+      await enqueueVideoJobsSave();
+    }
+
+    return videoJobs;
+  }
+
+  async function ensureVideoJobsLoaded() {
+    if (videoJobsLoaded) return videoJobs;
+    if (videoJobsLoadPromise) return videoJobsLoadPromise;
+
+    videoJobsLoadPromise = loadVideoJobsFromStorage()
+      .then((result) => {
+        videoJobsLoadPromise = null;
+        return result;
+      })
+      .catch((error) => {
+        videoJobsLoadPromise = null;
+        videoJobsLoaded = false;
+        throw error;
+      });
+
+    return videoJobsLoadPromise;
+  }
+
+  async function saveVideoJobsNow() {
+    pruneVideoJobsInMemory();
+
+    const payload = {
+      version: 1,
+      savedAtUnixMs: nowMs(),
+      jobs: Array.from(videoJobs.values()),
+    };
+
+    const encrypted = encryptVideoJobsPayload(payload);
+
+    await uploadRawJson(
+      VIDEO_JOBS_PUBLIC_ID,
+      encrypted
+    );
+  }
+
+  function enqueueVideoJobsSave() {
+    videoJobsWriteChain = videoJobsWriteChain
+      .catch(() => {})
+      .then(() => saveVideoJobsNow());
+
+    return videoJobsWriteChain;
+  }
+
+  function findVideoJobByClient(
+    senderId,
+    clientMessageId
+  ) {
+    if (!senderId || !clientMessageId) return null;
+
+    let best = null;
+
+    for (const job of videoJobs.values()) {
+      if (
+        job &&
+        job.senderId === senderId &&
+        job.clientMessageId === clientMessageId
+      ) {
+        if (
+          !best ||
+          Number(job.updatedAtUnixMs || 0) >
+            Number(best.updatedAtUnixMs || 0)
+        ) {
+          best = job;
+        }
+      }
+    }
+
+    return best;
+  }
+
+  function buildVideoRejectReason(source) {
+    let text = "";
+
+    try {
+      text = JSON.stringify(source || {}).toLowerCase();
+    } catch (_) {
+      text = "";
+    }
+
+    if (
+      text.includes("explicit_nudity") ||
+      text.includes("nudity") ||
+      text.includes("sexual") ||
+      text.includes("suggestive")
+    ) {
+      return "تم رفض الفيديو لأنه يحتوي على محتوى مخل أو غير مناسب";
+    }
+
+    if (
+      text.includes("violence") ||
+      text.includes("visually_disturbing")
+    ) {
+      return "تم رفض الفيديو لأنه يحتوي على محتوى عنيف أو مزعج";
+    }
+
+    if (
+      text.includes("rude_gestures") ||
+      text.includes("hate_symbols")
+    ) {
+      return "تم رفض الفيديو لأنه يحتوي على محتوى أو إشارات غير مناسبة";
+    }
+
+    if (
+      text.includes("drugs") ||
+      text.includes("tobacco") ||
+      text.includes("alcohol") ||
+      text.includes("gambling")
+    ) {
+      return "تم رفض الفيديو لأنه لا يتوافق مع سياسة المحتوى في الشات";
+    }
+
+    return "تم رفض الفيديو لأنه يحتوي على محتوى غير مناسب للشات";
+  }
+
+  function getDeepModerationStatus(value) {
+    if (!value || typeof value !== "object") return "";
+
+    const directCandidates = [
+      value.moderation_status,
+      value.moderationStatus,
+    ];
+
+    for (const candidate of directCandidates) {
+      const status =
+        String(candidate || "")
+          .trim()
+          .toLowerCase();
+
+      if (
+        status === "approved" ||
+        status === "rejected" ||
+        status === "pending"
+      ) {
+        return status;
+      }
+    }
+
+    const entry = getModerationEntry(
+      value,
+      VIDEO_MODERATION_KIND
+    );
+
+    if (entry) {
+      const status =
+        String(entry.status || "")
+          .trim()
+          .toLowerCase();
+
+      if (status) return status;
+    }
+
+    for (const child of Object.values(value)) {
+      if (
+        child &&
+        typeof child === "object"
+      ) {
+        const nested = getDeepModerationStatus(child);
+        if (nested) return nested;
+      }
+    }
+
+    return "";
+  }
+
+  async function getVideoModerationResource(publicId) {
+    return await cloudinary.api.resource(
+      publicId,
+      {
+        resource_type: "video",
+        type: "upload",
+        moderations: true,
+      }
+    );
+  }
+
+  async function finalizeApprovedVideoJob(
+    job,
+    moderationSource
+  ) {
+    if (!job) return null;
+
+    job.moderationStatus = "approved";
+    job.updatedAtUnixMs = nowMs();
+
+    // لو وصل Webhook قبل انتهاء callback الرفع، ننتظر.
+    if (
+      !job.uploadCompleted ||
+      !job.mediaUrl
+    ) {
+      job.status = "pending";
+      await enqueueVideoJobsSave();
+      return null;
+    }
+
+    const room =
+      await ensureRoomLoaded(job.roomId);
+
+    const duplicate =
+      findClientMessage(
+        room,
+        job.senderId,
+        job.clientMessageId
+      );
+
+    let message = duplicate;
+
+    if (!message) {
+      message = makeMessage({
+        roomId: job.roomId,
+        senderId: job.senderId,
+        profile: job.profile,
+        kind: "video",
+        reply: job.reply,
+        clientMessageId:
+          job.clientMessageId,
+      });
+
+      message.mediaType = "video";
+      message.mediaUrl =
+        safeString(job.mediaUrl, 1600);
+
+      message.mediaThumbnailUrl =
+        safeString(
+          job.mediaThumbnailUrl,
+          1600
+        );
+
+      message.mediaFileName =
+        safeString(
+          job.mediaFileName,
+          180
+        ) || "chat_video.mp4";
+
+      await pushMessage(
+        job.roomId,
+        message
+      );
+    }
+
+    job.status = "approved";
+    job.rejectReason = "";
+    job.messageId =
+      message && message.id
+        ? message.id
+        : job.messageId;
+
+    job.updatedAtUnixMs = nowMs();
+
+    await enqueueVideoJobsSave();
+
+    console.log(
+      "[LuxuryChat][VIDEO_MODERATION][APPROVED]",
+      {
+        publicId: job.publicId,
+        senderId: job.senderId,
+        clientMessageId:
+          job.clientMessageId,
+        messageId: job.messageId,
+      }
+    );
+
+    return message;
+  }
+
+  async function finalizeRejectedVideoJob(
+    job,
+    moderationSource
+  ) {
+    if (!job) return;
+
+    job.status = "rejected";
+    job.moderationStatus = "rejected";
+    job.rejectReason =
+      buildVideoRejectReason(
+        moderationSource
+      );
+
+    job.updatedAtUnixMs = nowMs();
+
+    await destroyCloudinaryAsset(
+      job.publicId,
+      "video"
+    );
+
+    await enqueueVideoJobsSave();
+
+    console.log(
+      "[LuxuryChat][VIDEO_MODERATION][REJECTED]",
+      {
+        publicId: job.publicId,
+        senderId: job.senderId,
+        clientMessageId:
+          job.clientMessageId,
+        reason: job.rejectReason,
+      }
+    );
+  }
+
+  async function applyVideoModerationResult(
+    publicId,
+    fallbackBody
+  ) {
+    await ensureVideoJobsLoaded();
+
+    const id = safeString(publicId, 500);
+    if (!id) return { status: "ignored" };
+
+    const job = videoJobs.get(id);
+
+    if (!job) {
+      console.warn(
+        "[LuxuryChat][VIDEO_MODERATION] job not found",
+        id
+      );
+
+      return {
+        status: "job_not_found",
+      };
+    }
+
+    // الـWebhook موقع من Cloudinary، لذلك إذا حمل نتيجة نهائية
+    // نستخدمها مباشرة بدون Admin API إضافي.
+    let source =
+      fallbackBody || {};
+
+    let status =
+      getDeepModerationStatus(source);
+
+    if (
+      status !== "approved" &&
+      status !== "rejected"
+    ) {
+      let resource = null;
+
+      try {
+        resource =
+          await getVideoModerationResource(id);
+
+        job.lastCloudinaryCheckUnixMs =
+          nowMs();
+      } catch (error) {
+        console.warn(
+          "[LuxuryChat][VIDEO_MODERATION] Admin API read failed",
+          {
+            publicId: id,
+            error:
+              error && error.message
+                ? error.message
+                : error,
+          }
+        );
+      }
+
+      if (resource) {
+        source = resource;
+        status =
+          getDeepModerationStatus(resource);
+      }
+    }
+
+    if (status === "approved") {
+      await finalizeApprovedVideoJob(
+        job,
+        source
+      );
+
+      return {
+        status: "approved",
+      };
+    }
+
+    if (status === "rejected") {
+      await finalizeRejectedVideoJob(
+        job,
+        source
+      );
+
+      return {
+        status: "rejected",
+      };
+    }
+
+    job.status = "pending";
+    job.moderationStatus =
+      status || "pending";
+
+    job.updatedAtUnixMs = nowMs();
+
+    await enqueueVideoJobsSave();
+
+    return {
+      status: "pending",
+    };
+  }
+
+  function verifyCloudinaryWebhook(req) {
+    const signature =
+      String(
+        req.headers["x-cld-signature"] ||
+          ""
+      )
+        .trim()
+        .replace(/^sha1=/i, "")
+        .replace(/^sha256=/i, "");
+
+    const timestampRaw =
+      String(
+        req.headers["x-cld-timestamp"] ||
+          ""
+      ).trim();
+
+    const timestamp =
+      Number(timestampRaw);
+
+    const rawBody =
+      typeof req.rawBody === "string"
+        ? req.rawBody
+        : "";
+
+    if (
+      !signature ||
+      !timestampRaw ||
+      !Number.isFinite(timestamp) ||
+      !rawBody ||
+      !CLOUDINARY_API_SECRET
+    ) {
+      return false;
+    }
+
+    const nowSeconds =
+      Math.floor(Date.now() / 1000);
+
+    if (
+      Math.abs(nowSeconds - timestamp) >
+      CLOUDINARY_WEBHOOK_MAX_AGE_SECONDS
+    ) {
+      return false;
+    }
+
+    const algorithm =
+      signature.length === 64
+        ? "sha256"
+        : "sha1";
+
+    const expected =
+      crypto
+        .createHash(algorithm)
+        .update(
+          rawBody +
+            timestampRaw +
+            CLOUDINARY_API_SECRET,
+          "utf8"
+        )
+        .digest("hex");
+
+    const a = Buffer.from(
+      expected,
+      "utf8"
+    );
+
+    const b = Buffer.from(
+      signature,
+      "utf8"
+    );
+
+    if (a.length !== b.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(
+      a,
+      b
+    );
+  }
+
+  function extractWebhookPublicId(body) {
+    if (!body || typeof body !== "object") {
+      return "";
+    }
+
+    const direct =
+      safeString(body.public_id, 500);
+
+    if (direct) return direct;
+
+    for (const child of Object.values(body)) {
+      if (
+        child &&
+        typeof child === "object"
+      ) {
+        const nested =
+          extractWebhookPublicId(child);
+
+        if (nested) return nested;
+      }
+    }
+
+    return "";
+  }
+
   function normalizeMessage(raw, roomId) {
     if (!raw || typeof raw !== "object") return null;
 
@@ -588,7 +1393,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     pruneExpired(room);
 
     await uploadRawJson(historyPublicId(roomId), {
-      version: 4,
+      version: 5,
       room: cleanRoom(roomId),
       seq: Math.max(0, Number(room.seq) || 0),
       retentionDays: RETENTION_DAYS,
@@ -754,10 +1559,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   }
 
   function getModerationEntry(uploadResult, kind) {
-    const moderation =
-      uploadResult && Array.isArray(uploadResult.moderation)
-        ? uploadResult.moderation
-        : [];
+    let moderation = [];
+
+    if (uploadResult && Array.isArray(uploadResult.moderation)) {
+      moderation = uploadResult.moderation;
+    } else if (uploadResult && Array.isArray(uploadResult.moderations)) {
+      moderation = uploadResult.moderations;
+    }
 
     for (const item of moderation) {
       if (!item || typeof item !== "object") continue;
@@ -976,50 +1784,117 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   }
 
   // ==========================================================================
-  // VIDEO UPLOAD
+  // VIDEO UPLOAD + AMAZON REKOGNITION VIDEO MODERATION
   //
-  // هذه النسخة تبقي الفيديو بالنظام السابق فقط.
-  // سنضيف aws_rek_video + pending + webhook في الخطوة التالية.
+  // الرفع يرجع عادة pending لأن الفحص غير متزامن.
+  // لا ننشر رسالة الفيديو هنا.
   // ==========================================================================
 
-  function uploadVideoBuffer(buffer, playFabId) {
+  function uploadVideoBuffer(
+    buffer,
+    playFabId,
+    forcedPublicId
+  ) {
     return new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          resource_type: "video",
-          folder: VIDEO_FOLDER,
-          public_id: uniqueMediaPublicId(playFabId),
-          overwrite: false,
-        },
-        (error, result) => {
-          if (error) return reject(error);
+      const publicId =
+        safeString(forcedPublicId, 500) ||
+        `${VIDEO_FOLDER}/${uniqueMediaPublicId(playFabId)}`;
 
-          if (!result || !result.secure_url) {
-            return reject(new Error("cloudinary_no_url"));
-          }
-
-          const thumb = cloudinary.url(result.public_id, {
+      const stream =
+        cloudinary.uploader.upload_stream(
+          {
             resource_type: "video",
-            type: "upload",
-            secure: true,
-            format: "jpg",
-            transformation: [
-              {
-                width: 700,
-                height: 394,
-                crop: "limit",
-                quality: "auto:good",
-              },
-            ],
-          });
 
-          resolve({
-            url: result.secure_url,
-            thumbnailUrl: thumb || "",
-            publicId: result.public_id || "",
-          });
-        }
-      );
+            // لأن publicId هنا يحتوي المجلد بالفعل.
+            public_id: publicId,
+
+            overwrite: false,
+
+            moderation:
+              VIDEO_MODERATION_KIND,
+
+            notification_url:
+              VIDEO_MODERATION_WEBHOOK_URL,
+          },
+          (error, result) => {
+            if (error) {
+              return reject(error);
+            }
+
+            if (
+              !result ||
+              !result.public_id ||
+              !result.secure_url
+            ) {
+              return reject(
+                makeChatError(
+                  "VIDEO_UPLOAD_NO_RESULT",
+                  "cloudinary_video_no_result"
+                )
+              );
+            }
+
+            const moderationStatus =
+              getModerationStatus(
+                result,
+                VIDEO_MODERATION_KIND
+              ) ||
+              getDeepModerationStatus(
+                result
+              ) ||
+              "pending";
+
+            const thumb =
+              cloudinary.url(
+                result.public_id,
+                {
+                  resource_type:
+                    "video",
+
+                  type:
+                    "upload",
+
+                  secure:
+                    true,
+
+                  format:
+                    "jpg",
+
+                  transformation: [
+                    {
+                      width: 700,
+                      height: 394,
+                      crop: "limit",
+                      quality:
+                        "auto:good",
+                    },
+                  ],
+                }
+              );
+
+            resolve({
+              url:
+                result.secure_url,
+
+              thumbnailUrl:
+                thumb || "",
+
+              publicId:
+                result.public_id || "",
+
+              moderationStatus:
+                String(
+                  moderationStatus ||
+                    "pending"
+                )
+                  .trim()
+                  .toLowerCase(),
+
+              raw:
+                result,
+            });
+          }
+        );
 
       stream.end(buffer);
     });
@@ -1407,6 +2282,211 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     }
   );
 
+
+  // ==========================================================================
+  // CLOUDINARY VIDEO MODERATION WEBHOOK
+  //
+  // Cloudinary يرسل النتيجة هنا بعد انتهاء aws_rek_video.
+  // التوقيع يعتمد على req.rawBody، لذلك server.js يجب أن يحتفظ به
+  // داخل express.json({ verify: ... }).
+  // ==========================================================================
+
+  app.post(
+    VIDEO_MODERATION_WEBHOOK_PATH,
+    async (req, res) => {
+      try {
+        if (!verifyCloudinaryWebhook(req)) {
+          console.warn(
+            "[LuxuryChat][VIDEO_WEBHOOK] invalid signature"
+          );
+
+          return res
+            .status(401)
+            .json({
+              ok: false,
+              error:
+                "invalid_cloudinary_signature",
+            });
+        }
+
+        const publicId =
+          extractWebhookPublicId(
+            req.body
+          );
+
+        if (!publicId) {
+          console.warn(
+            "[LuxuryChat][VIDEO_WEBHOOK] public_id missing"
+          );
+
+          // الطلب موقع من Cloudinary لكن ليس نتيجة نحتاجها.
+          return res.json({
+            ok: true,
+            ignored: true,
+          });
+        }
+
+        const result =
+          await applyVideoModerationResult(
+            publicId,
+            req.body
+          );
+
+        return res.json({
+          ok: true,
+          publicId,
+          status:
+            result &&
+            result.status
+              ? result.status
+              : "pending",
+        });
+      } catch (error) {
+        console.error(
+          "[LuxuryChat][VIDEO_WEBHOOK]",
+          error
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "video_moderation_webhook_failed",
+          });
+      }
+    }
+  );
+
+  // ==========================================================================
+  // VIDEO STATUS FOR UNITY
+  //
+  // Unity سيستخدمه بعد رفع الفيديو:
+  // pending  -> "جاري فحص الفيديو..."
+  // approved -> يحذف الفقاعة المؤقتة ويعرض الرسالة الحقيقية من History
+  // rejected -> يعرض rejectReason عند المرسل فقط
+  // ==========================================================================
+
+  app.post(
+    "/chat/video-status",
+    async (req, res) => {
+      try {
+        const playFabId =
+          await authenticateSessionTicket(
+            req.body &&
+              req.body.sessionTicket
+          );
+
+        const clientMessageId =
+          cleanClientMessageId(
+            req.body &&
+              req.body.clientMessageId
+          );
+
+        if (!clientMessageId) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "clientMessageId مطلوب",
+            });
+        }
+
+        await ensureVideoJobsLoaded();
+
+        const job =
+          findVideoJobByClient(
+            playFabId,
+            clientMessageId
+          );
+
+        if (!job) {
+          return res
+            .status(404)
+            .json({
+              ok: false,
+              status:
+                "not_found",
+              error:
+                "حالة الفيديو غير موجودة",
+            });
+        }
+
+        // احتياط: لو ضاع Webhook لكن Cloudinary أنهى الفحص،
+        // نتحقق من المصدر الحقيقي عند كل استعلام pending.
+        if (
+          (job.status === "pending" ||
+            job.status === "uploading") &&
+          nowMs() -
+              Number(
+                job.lastCloudinaryCheckUnixMs ||
+                  0
+              ) >=
+            VIDEO_STATUS_FALLBACK_CHECK_MS
+        ) {
+          try {
+            await applyVideoModerationResult(
+              job.publicId,
+              null
+            );
+          } catch (error) {
+            console.warn(
+              "[LuxuryChat][VIDEO_STATUS] refresh failed",
+              error &&
+              error.message
+                ? error.message
+                : error
+            );
+          }
+        }
+
+        const fresh =
+          videoJobs.get(
+            job.publicId
+          ) || job;
+
+        return res.json({
+          ok: true,
+
+          clientMessageId:
+            fresh.clientMessageId,
+
+          status:
+            fresh.status,
+
+          moderationStatus:
+            fresh.moderationStatus,
+
+          rejectReason:
+            fresh.status ===
+            "rejected"
+              ? fresh.rejectReason
+              : "",
+
+          messageId:
+            fresh.status ===
+            "approved"
+              ? fresh.messageId
+              : "",
+        });
+      } catch (error) {
+        console.error(
+          "/chat/video-status",
+          error
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok: false,
+            error:
+              "تعذر قراءة حالة الفيديو",
+          });
+      }
+    }
+  );
+
   // ==========================================================================
   // SEND IMAGE / VIDEO
   //
@@ -1521,55 +2601,374 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           req.body && req.body.replyToMessageId
         );
 
-        let uploaded;
+        // ================================================================
+        // VIDEO:
+        // لا ننشئ Message عامة الآن.
+        // نحفظ Job ثم نرفع الفيديو مع aws_rek_video.
+        // ================================================================
 
-        if (requestedType === "image") {
-          // uploadImageBuffer لن يرجع نجاح إلا عند approved.
-          uploaded = await uploadImageBuffer(req.file.buffer, playFabId);
-        } else {
-          uploaded = await uploadVideoBuffer(req.file.buffer, playFabId);
-        }
+        if (requestedType === "video") {
+          await ensureVideoJobsLoaded();
 
-        // حماية إضافية:
-        // حتى لو تغير uploadImageBuffer لاحقًا بالخطأ، لا ننشر صورة
-        // بدون approved صريح.
-        if (
-          requestedType === "image" &&
-          String(uploaded && uploaded.moderationStatus || "")
-            .trim()
-            .toLowerCase() !== "approved"
-        ) {
-          if (uploaded && uploaded.publicId) {
-            await destroyCloudinaryAsset(uploaded.publicId, "image");
+          const effectiveClientMessageId =
+            clientMessageId ||
+            `video_${crypto.randomUUID()}`;
+
+          const existingJob =
+            findVideoJobByClient(
+              playFabId,
+              effectiveClientMessageId
+            );
+
+          if (existingJob) {
+            return res.json({
+              ok: true,
+              pending:
+                existingJob.status !==
+                  "approved" &&
+                existingJob.status !==
+                  "rejected",
+
+              status:
+                existingJob.status,
+
+              moderationStatus:
+                existingJob.moderationStatus,
+
+              clientMessageId:
+                existingJob.clientMessageId,
+
+              rejectReason:
+                existingJob.status ===
+                "rejected"
+                  ? existingJob.rejectReason
+                  : "",
+
+              messageId:
+                existingJob.status ===
+                "approved"
+                  ? existingJob.messageId
+                  : "",
+            });
           }
 
-          return res.status(503).json({
-            ok: false,
-            error: "تعذر اعتماد الصورة من نظام الحماية، حاول مرة أخرى",
+          const videoPublicId =
+            `${VIDEO_FOLDER}/${uniqueMediaPublicId(playFabId)}`;
+
+          const job = {
+            jobId:
+              crypto.randomUUID(),
+
+            publicId:
+              videoPublicId,
+
+            senderId:
+              safeString(
+                playFabId,
+                100
+              ),
+
+            roomId:
+              cleanRoom(roomId),
+
+            clientMessageId:
+              effectiveClientMessageId,
+
+            status:
+              "uploading",
+
+            moderationStatus:
+              "pending",
+
+            createdAtUnixMs:
+              nowMs(),
+
+            updatedAtUnixMs:
+              nowMs(),
+
+            uploadCompleted:
+              false,
+
+            lastCloudinaryCheckUnixMs:
+              0,
+
+            mediaUrl:
+              "",
+
+            mediaThumbnailUrl:
+              "",
+
+            mediaFileName:
+              sanitizeFileName(
+                req.file.originalname,
+                "chat_video.mp4"
+              ),
+
+            rejectReason:
+              "",
+
+            messageId:
+              "",
+
+            profile: {
+              playerName:
+                safeString(
+                  profile &&
+                    profile.playerName,
+                  64
+                ) || "لاعب",
+
+              avatarUrl:
+                safeString(
+                  profile &&
+                    profile.avatarUrl,
+                  1000
+                ),
+
+              avatarVersion:
+                safeString(
+                  profile &&
+                    profile.avatarVersion,
+                  100
+                ) || "0",
+            },
+
+            reply: {
+              replyToId:
+                safeString(
+                  reply &&
+                    reply.replyToId,
+                  100
+                ),
+
+              replyToName:
+                safeString(
+                  reply &&
+                    reply.replyToName,
+                  64
+                ),
+
+              replyToPreview:
+                safeString(
+                  reply &&
+                    reply.replyToPreview,
+                  120
+                ),
+            },
+          };
+
+          // نحفظ Job قبل Cloudinary حتى لو وصل Webhook بسرعة.
+          videoJobs.set(
+            videoPublicId,
+            job
+          );
+
+          await enqueueVideoJobsSave();
+
+          let uploadedVideo;
+
+          try {
+            uploadedVideo =
+              await uploadVideoBuffer(
+                req.file.buffer,
+                playFabId,
+                videoPublicId
+              );
+          } catch (error) {
+            videoJobs.delete(
+              videoPublicId
+            );
+
+            await enqueueVideoJobsSave();
+
+            throw error;
+          }
+
+          job.uploadCompleted =
+            true;
+
+          job.mediaUrl =
+            safeString(
+              uploadedVideo.url,
+              1600
+            );
+
+          job.mediaThumbnailUrl =
+            safeString(
+              uploadedVideo.thumbnailUrl,
+              1600
+            );
+
+          job.moderationStatus =
+            safeString(
+              uploadedVideo.moderationStatus,
+              30
+            ) || "pending";
+
+          job.status =
+            job.moderationStatus ===
+            "approved"
+              ? "pending"
+              : job.moderationStatus ===
+                "rejected"
+              ? "pending"
+              : "pending";
+
+          job.updatedAtUnixMs =
+            nowMs();
+
+          await enqueueVideoJobsSave();
+
+          console.log(
+            "[LuxuryChat][VIDEO_MODERATION][UPLOADED]",
+            {
+              publicId:
+                job.publicId,
+
+              senderId:
+                job.senderId,
+
+              clientMessageId:
+                job.clientMessageId,
+
+              moderationStatus:
+                job.moderationStatus,
+
+              webhook:
+                VIDEO_MODERATION_WEBHOOK_URL,
+            }
+          );
+
+          // لو Cloudinary أعطى نتيجة نهائية بسرعة نطبقها،
+          // وإلا يظل pending حتى Webhook أو /chat/video-status.
+          if (
+            job.moderationStatus ===
+              "approved" ||
+            job.moderationStatus ===
+              "rejected"
+          ) {
+            await applyVideoModerationResult(
+              job.publicId,
+              uploadedVideo.raw
+            );
+          }
+
+          const fresh =
+            videoJobs.get(
+              job.publicId
+            ) || job;
+
+          return res.json({
+            ok: true,
+
+            pending:
+              fresh.status !==
+                "approved" &&
+              fresh.status !==
+                "rejected",
+
+            status:
+              fresh.status,
+
+            moderationStatus:
+              fresh.moderationStatus,
+
+            clientMessageId:
+              fresh.clientMessageId,
+
+            rejectReason:
+              fresh.status ===
+              "rejected"
+                ? fresh.rejectReason
+                : "",
+
+            messageId:
+              fresh.status ===
+              "approved"
+                ? fresh.messageId
+                : "",
           });
         }
 
-        const message = makeMessage({
-          roomId,
-          senderId: playFabId,
-          profile,
-          kind: requestedType,
-          reply,
-          clientMessageId,
-        });
+        // ================================================================
+        // IMAGE:
+        // نفس حماية V4 بدون تغيير.
+        // ================================================================
 
-        message.mediaType = requestedType;
-        message.mediaUrl = safeString(uploaded.url, 1600);
-        message.mediaThumbnailUrl = safeString(uploaded.thumbnailUrl, 1600);
-        message.mediaFileName = sanitizeFileName(
-          req.file.originalname,
-          requestedType === "image" ? "chat_image.jpg" : "chat_video.mp4"
+        const uploaded =
+          await uploadImageBuffer(
+            req.file.buffer,
+            playFabId
+          );
+
+        if (
+          String(
+            uploaded &&
+              uploaded.moderationStatus ||
+              ""
+          )
+            .trim()
+            .toLowerCase() !==
+          "approved"
+        ) {
+          if (
+            uploaded &&
+            uploaded.publicId
+          ) {
+            await destroyCloudinaryAsset(
+              uploaded.publicId,
+              "image"
+            );
+          }
+
+          return res
+            .status(503)
+            .json({
+              ok: false,
+              error:
+                "تعذر اعتماد الصورة من نظام الحماية، حاول مرة أخرى",
+            });
+        }
+
+        const message =
+          makeMessage({
+            roomId,
+            senderId:
+              playFabId,
+            profile,
+            kind:
+              "image",
+            reply,
+            clientMessageId,
+          });
+
+        message.mediaType =
+          "image";
+
+        message.mediaUrl =
+          safeString(
+            uploaded.url,
+            1600
+          );
+
+        message.mediaThumbnailUrl =
+          safeString(
+            uploaded.thumbnailUrl,
+            1600
+          );
+
+        message.mediaFileName =
+          sanitizeFileName(
+            req.file.originalname,
+            "chat_image.jpg"
+          );
+
+        await pushMessage(
+          roomId,
+          message
         );
 
-        // لا تصل الصورة إلى هنا إلا بعد approved.
-        await pushMessage(roomId, message);
-
-        res.json({
+        return res.json({
           ok: true,
           message,
         });
@@ -1602,6 +3001,16 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           return res.status(502).json({
             ok: false,
             error: "تعذر اعتماد الصورة بعد رفعها",
+          });
+        }
+
+        if (
+          error &&
+          error.code === "VIDEO_UPLOAD_NO_RESULT"
+        ) {
+          return res.status(502).json({
+            ok: false,
+            error: "تعذر رفع الفيديو للفحص",
           });
         }
 
@@ -1710,10 +3119,12 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ==========================================================================
 
   console.log("[LuxuryChat] installed", {
-    version: 4,
+    version: 5,
     imageModeration: IMAGE_MODERATION_KIND,
     imageModerationFailClosed: true,
-    videoModeration: "not-yet-enabled-step-2",
+    videoModeration: VIDEO_MODERATION_KIND,
+    videoModerationWebhook: VIDEO_MODERATION_WEBHOOK_URL,
+    videoPendingPersistence: "Cloudinary encrypted raw JSON",
     persistentHistory: "Cloudinary raw JSON",
     retentionDays: RETENTION_DAYS,
     fetchLimit: MAX_FETCH_LIMIT,
@@ -1727,6 +3138,8 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       "/chat/send",
       "/chat/voice",
       "/chat/media",
+      "/chat/video-status",
+      VIDEO_MODERATION_WEBHOOK_PATH,
       "/chat/report",
     ],
   });
