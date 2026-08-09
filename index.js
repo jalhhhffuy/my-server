@@ -6,7 +6,26 @@ const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
 
-app.use(express.json());
+app.use(
+    express.json({
+        verify: (
+            req,
+            res,
+            buffer
+        ) => {
+            /*
+             * Cloudinary Webhook Signature:
+             * نحتاج النص الخام كما وصل من Cloudinary حتى نتحقق من
+             * X-Cld-Signature + X-Cld-Timestamp بدون إعادة بناء JSON.
+             */
+            req.rawBody =
+                buffer &&
+                buffer.length
+                    ? buffer.toString("utf8")
+                    : "";
+        }
+    })
+);
 
 const SERVER_URL =
     "https://my-server-i40i.onrender.com";
@@ -2116,4 +2135,3 @@ app.listen(
         );
     }
 );
-
