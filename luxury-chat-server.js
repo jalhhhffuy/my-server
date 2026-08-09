@@ -1,14 +1,14 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V10 FINAL HARDENED
+// Luxury Chat Server - V11 FINAL HARDENED
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
 // IMAGE + VIDEO MODERATION: Amazon Rekognition via Cloudinary
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // BUILD:
-// 2026-08-10-LUXURY-CHAT-SERVER-V10-FINAL-HARDENED-VIDEO-RACE-ORPHAN-CLEANUP
+// 2026-08-10-LUXURY-CHAT-SERVER-V11-ADMIN-THROTTLE-CORRUPT-SHARD-IDEMPOTENT-MEDIA
 //
 // server.js:
 // const installLuxuryChat = require("./luxury-chat-server");
@@ -31,7 +31,7 @@
 // V10 يدعم أيضاً Buffer ويحاول JSON.stringify(req.body) كـ fallback آمن للتوقيع
 // إذا لم يكن rawBody متوفراً، لكنه لا يقبل Webhook غير موقع.
 //
-// أهم إصلاحات V10 فوق V9:
+// أهم إصلاحات V11 فوق V10:
 // - نفس نظام History shards الخاص بـV9 بدون Shared Overwrite.
 // - منع تراجع حالة الفيديو من approved/rejected إلى pending بسبب سباق Webhook/Upload callback.
 // - Cloudinary Admin API هو المرجع النهائي لحالة الفيديو متى أمكن.
@@ -45,6 +45,9 @@
 // - لا يرجع Success لرسالة لم يتم التحقق من وجودها داخل Shard الخاص بها.
 // - آخر 100 رسالة حقيقية + حالات التفاعل، والتفاعلات لا تأخذ من حد 100.
 // - Message ID حتمي عند وجود clientMessageId لمنع Retry مزدوج بين instances.
+// - تخفيض ضغط Cloudinary Admin API: اكتشاف Shards على فترات، مع قراءة المحتوى من Delivery URL بين الاكتشافات.
+// - Shard فيديو تالف لا يعطل كل رفع/حالة الفيديو؛ يتم عزله، والمنتهي منه يحذف بأمان.
+// - Public ID حتمي للصوت/الصور/الفيديو عند وجود clientMessageId لمنع رفع أصلين لنفس Retry بين instances.
 // ============================================================================
 
 const multer = require("multer");
@@ -60,7 +63,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-10-LUXURY-CHAT-SERVER-V10-FINAL-HARDENED-VIDEO-RACE-ORPHAN-CLEANUP";
+    "2026-08-10-LUXURY-CHAT-SERVER-V11-ADMIN-THROTTLE-CORRUPT-SHARD-IDEMPOTENT-MEDIA";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -93,7 +96,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       ? new Intl.Segmenter("ar", { granularity: "grapheme" })
       : null;
 
-  // نبقي مجلد V8/V9 نفسه حتى لا نفصل تاريخ النسخة الحالية عن V10.
+  // نبقي مجلد V8/V9 نفسه حتى لا نفصل تاريخ النسخة الحالية عن V11.
   const HISTORY_FOLDER = "luxury_chat_history_v8";
   const LEGACY_HISTORY_FOLDER = "luxury_chat_history";
 
@@ -114,6 +117,16 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   const VIDEO_FOLDER = "chat_media_videos";
 
   const HISTORY_CACHE_SYNC_MS = 1500;
+  // Admin API في Cloudinary محدود؛ نستخدمه فقط لاكتشاف Shards الجديدة.
+  // تحديث Shards المعروفة يتم من Delivery URL غير المرقم بالإصدار.
+  const HISTORY_SHARD_DISCOVERY_MS = Math.max(
+    5000,
+    Number(process.env.CHAT_HISTORY_SHARD_DISCOVERY_MS || 20000) || 20000
+  );
+  const VIDEO_JOB_SHARD_DISCOVERY_MS = Math.max(
+    5000,
+    Number(process.env.CHAT_VIDEO_JOB_SHARD_DISCOVERY_MS || 20000) || 20000
+  );
   const HISTORY_READ_RETRY_DELAYS_MS = [0, 160, 420, 900];
   const HISTORY_WRITE_VERIFY_ATTEMPTS = 4;
   const HISTORY_WRITE_VERIFY_SETTLE_MS = 140;
@@ -211,6 +224,8 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
   const videoJobs = new Map();
   const videoJobShardCache = new Map();
+  const videoJobKnownResources = new Map();
+  let lastVideoJobShardDiscoveryUnixMs = 0;
   let videoJobsLoaded = false;
   let videoJobsLoadPromise = null;
   let videoJobsWriteChain = Promise.resolve();
@@ -540,6 +555,8 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         mutationChain: Promise.resolve(),
         lastStorageSyncMs: 0,
         lastStorageSavedAtUnixMs: 0,
+        lastShardDiscoveryMs: 0,
+        knownShardResources: new Map(),
         shardCache: new Map(),
         legacyCache: null,
         legacyMissingUntilMs: 0,
@@ -819,6 +836,78 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     } while (nextCursor);
 
     return resources;
+  }
+
+  function rawDeliveryUrl(publicId) {
+    return cloudinary.url(publicId, {
+      resource_type: "raw",
+      type: "upload",
+      secure: true,
+    });
+  }
+
+  async function getKnownHistoryShardResources(room, forceDiscovery = false) {
+    const current = nowMs();
+    const shouldDiscover =
+      !room.knownShardResources ||
+      room.knownShardResources.size === 0 ||
+      room.lastShardDiscoveryMs <= 0 ||
+      current - room.lastShardDiscoveryMs >= HISTORY_SHARD_DISCOVERY_MS ||
+      (forceDiscovery && !room.loaded);
+
+    if (shouldDiscover) {
+      const discovered = await listHistoryShardResources(room.id);
+      if (!room.knownShardResources) room.knownShardResources = new Map();
+
+      for (const resource of discovered) {
+        room.knownShardResources.set(resource.publicId, resource);
+      }
+
+      room.lastShardDiscoveryMs = current;
+    }
+
+    return Array.from((room.knownShardResources || new Map()).values());
+  }
+
+  async function loadKnownHistoryShardDocument(room, resource) {
+    const publicId = safeString(resource && resource.publicId, 600);
+    if (!publicId) return null;
+
+    const deliveryUrl = rawDeliveryUrl(publicId);
+    const cached = room.shardCache.get(publicId);
+
+    try {
+      const document = await fetchHistoryDocumentFromUrl(room.id, deliveryUrl);
+      if (!document) {
+        if (cached && cached.document) return cached.document;
+        return null;
+      }
+
+      document.storagePublicId = publicId;
+      document.storageVersion = Math.max(
+        Number(resource && resource.version) || 0,
+        Number(document.storageVersion) || 0
+      );
+      document.secureUrl = deliveryUrl;
+
+      room.shardCache.set(publicId, {
+        version: document.storageVersion,
+        secureUrl: deliveryUrl,
+        document,
+      });
+
+      return document;
+    } catch (error) {
+      if (cached && cached.document) {
+        console.warn("[LuxuryChat][HISTORY][DELIVERY_CACHE_FALLBACK]", {
+          room: room.id,
+          publicId,
+          error: error && error.message ? error.message : error,
+        });
+        return cached.document;
+      }
+      throw error;
+    }
   }
 
   function pruneExpired(room) {
@@ -1180,6 +1269,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
     if (await destroyRawAsset(resource.publicId)) {
       room.shardCache.delete(resource.publicId);
+      if (room.knownShardResources) room.knownShardResources.delete(resource.publicId);
       console.log("[LuxuryChat][HISTORY][EXPIRED_SHARD_DELETED]", {
         room: room.id,
         publicId: resource.publicId,
@@ -1203,7 +1293,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
     room.syncPromise = (async () => {
       try {
-        const resources = await listHistoryShardResources(room.id);
+        const resources = await getKnownHistoryShardResources(room, force);
         const activeResources = [];
         const expiredResources = [];
 
@@ -1222,7 +1312,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         const shardPairs = await Promise.all(
           activeResources.map(async (resource) => ({
             resource,
-            document: await loadShardDocument(room, resource),
+            // لا نحتاج Admin API لمعرفة version كل 1.5 ثانية؛
+            // Delivery URL غير المرقم يعطينا أحدث محتوى للـpublic_id المعروف.
+            document: await loadKnownHistoryShardDocument(room, resource),
           }))
         );
 
@@ -1367,7 +1459,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     repairSequenceCollisions(tempRoom);
 
     return {
-      version: 10,
+      version: 11,
       build: SERVER_BUILD,
       storageMode: "render-process-daily-shard",
       room: cleanRoom(roomId),
@@ -1402,7 +1494,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         secureUrl: "",
         document: {
           exists: true,
-          version: 10,
+          version: 11,
           room: room.id,
           seq: 0,
           retentionDays: RETENTION_DAYS,
@@ -1518,6 +1610,14 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           document: verifyDocument,
         });
 
+        if (!room.knownShardResources) room.knownShardResources = new Map();
+        room.knownShardResources.set(localShard.publicId, {
+          publicId: localShard.publicId,
+          secureUrl: verifyDocument.secureUrl,
+          version: verifyDocument.storageVersion,
+          createdAt: "",
+        });
+
         room.lastStorageSavedAtUnixMs = nowMs();
         room.lastStorageSyncMs = nowMs();
         return room;
@@ -1603,7 +1703,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   }
 
   // ========================================================================
-  // VIDEO MODERATION JOB PERSISTENCE - V10 HARDENED SHARDS
+  // VIDEO MODERATION JOB PERSISTENCE - V11 HARDENED SHARDS
   // ========================================================================
 
   function legacyVideoJobsUrl() {
@@ -1955,6 +2055,33 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     return resources;
   }
 
+  async function getKnownVideoJobShardResources(forceDiscovery = false) {
+    const current = nowMs();
+    const shouldDiscover =
+      videoJobKnownResources.size === 0 ||
+      lastVideoJobShardDiscoveryUnixMs <= 0 ||
+      current - lastVideoJobShardDiscoveryUnixMs >= VIDEO_JOB_SHARD_DISCOVERY_MS ||
+      (forceDiscovery && !videoJobsLoaded);
+
+    if (shouldDiscover) {
+      const discovered = await listVideoJobShardResources();
+      for (const resource of discovered) {
+        videoJobKnownResources.set(resource.publicId, resource);
+      }
+      lastVideoJobShardDiscoveryUnixMs = current;
+    }
+
+    return Array.from(videoJobKnownResources.values());
+  }
+
+  function videoJobShardDefinitelyExpired(resource) {
+    if (!resource || !resource.publicId) return false;
+    const shardDay = extractVideoJobShardDay(resource.publicId);
+    const dayEnd = dayKeyEndUnixMs(shardDay);
+    if (!dayEnd) return false;
+    return dayEnd <= nowMs() - VIDEO_JOB_RETENTION_MS;
+  }
+
   async function readEncryptedVideoJobsUrl(url) {
     const response = await fetchWithTimeout(
       addCacheBust(url),
@@ -2056,6 +2183,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         try {
           await destroyRawAsset(pair.resource.publicId);
           videoJobShardCache.delete(pair.resource.publicId);
+          videoJobKnownResources.delete(pair.resource.publicId);
 
           console.log("[LuxuryChat][VIDEO_JOBS][EXPIRED_SHARD_DELETED]", {
             publicId: pair.resource.publicId,
@@ -2070,8 +2198,8 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     );
   }
 
-  async function loadVideoJobsFromStorage() {
-    const resources = await listVideoJobShardResources();
+  async function loadVideoJobsFromStorage(forceDiscovery = false) {
+    const resources = await getKnownVideoJobShardResources(forceDiscovery);
     const shardPairs = [];
 
     // كل Shard معروف يجب أن يكون قابلاً للقراءة أو نستخدم Cache سليمة.
@@ -2079,27 +2207,42 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       const cached = videoJobShardCache.get(resource.publicId);
       let jobs = null;
 
-      if (cached && cached.version === resource.version && cached.jobs) {
-        jobs = cached.jobs;
-      } else {
-        try {
-          jobs = await readEncryptedVideoJobsUrl(resource.secureUrl);
-          if (!jobs) throw new Error("video_jobs_shard_not_found");
+      try {
+        // نقرأ أحدث نسخة من Delivery URL غير المرقم، بدون Admin resource لكل تحديث.
+        jobs = await readEncryptedVideoJobsUrl(rawDeliveryUrl(resource.publicId));
+        if (!jobs) throw new Error("video_jobs_shard_not_found");
 
-          videoJobShardCache.set(resource.publicId, {
-            version: resource.version,
-            secureUrl: resource.secureUrl,
-            jobs,
+        videoJobShardCache.set(resource.publicId, {
+          version: resource.version,
+          secureUrl: rawDeliveryUrl(resource.publicId),
+          jobs,
+        });
+      } catch (error) {
+        if (cached && cached.jobs) {
+          jobs = cached.jobs;
+          console.warn("[LuxuryChat][VIDEO_JOBS][SHARD_CACHE_FALLBACK]", {
+            publicId: resource.publicId,
+            error: error && error.message ? error.message : error,
           });
-        } catch (error) {
-          if (cached && cached.jobs) {
-            jobs = cached.jobs;
-            console.warn("[LuxuryChat][VIDEO_JOBS][SHARD_CACHE_FALLBACK]", {
-              publicId: resource.publicId,
-              error: error && error.message ? error.message : error,
-            });
-          } else {
-            throw error;
+        } else {
+          // Shard تالف/غير قابل للقراءة لا يعطل جميع الفيديوهات.
+          // إذا انتهت مدة الاحتفاظ نحذفه فوراً؛ وإلا نعزله ونكمل.
+          jobs = [];
+          console.error("[LuxuryChat][VIDEO_JOBS][CORRUPT_SHARD_SKIPPED]", {
+            publicId: resource.publicId,
+            error: error && error.message ? error.message : error,
+          });
+
+          if (videoJobShardDefinitelyExpired(resource)) {
+            try {
+              await destroyRawAsset(resource.publicId);
+              videoJobKnownResources.delete(resource.publicId);
+              videoJobShardCache.delete(resource.publicId);
+              console.warn("[LuxuryChat][VIDEO_JOBS][CORRUPT_EXPIRED_SHARD_DELETED]", {
+                publicId: resource.publicId,
+              });
+              continue;
+            } catch (_) {}
           }
         }
       }
@@ -2146,7 +2289,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     if (videoJobsLoadPromise) return videoJobsLoadPromise;
     if (videoJobsLoaded && !forceRefresh) return videoJobs;
 
-    videoJobsLoadPromise = loadVideoJobsFromStorage()
+    videoJobsLoadPromise = loadVideoJobsFromStorage(forceRefresh)
       .then((result) => {
         videoJobsLoadPromise = null;
         return result;
@@ -2180,7 +2323,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     const publicId = videoJobsShardPublicId(dayKey);
 
     const payload = {
-      version: 10,
+      version: 11,
       build: SERVER_BUILD,
       storageMode: "render-process-daily-video-job-shard",
       shardDay: dayKey,
@@ -2235,11 +2378,19 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       }
     }
 
-    videoJobShardCache.set(publicId, {
+    const savedVideoJobResource = {
+      publicId,
       version: Math.max(0, Number(uploadResult.version) || 0),
       secureUrl: String(uploadResult.secure_url),
+      createdAt: "",
+    };
+
+    videoJobShardCache.set(publicId, {
+      version: savedVideoJobResource.version,
+      secureUrl: savedVideoJobResource.secureUrl,
       jobs: verifyJobs,
     });
+    videoJobKnownResources.set(publicId, savedVideoJobResource);
   }
 
   function enqueueVideoJobsSave() {
@@ -2433,10 +2584,48 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // CLOUDINARY MEDIA
   // ========================================================================
 
+  function safeMediaIdSegment(value, fallback = "player") {
+    const cleaned = String(value || "")
+      .replace(/[^a-zA-Z0-9_-]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 70);
+    return cleaned || fallback;
+  }
+
   function uniqueMediaPublicId(playFabId) {
-    return `${safeString(playFabId, 80)}_${Date.now()}_${crypto
+    return `${safeMediaIdSegment(playFabId)}_${Date.now()}_${crypto
       .randomBytes(5)
       .toString("hex")}`;
+  }
+
+  function mediaPublicId(folder, playFabId, clientMessageId, kind) {
+    const client = cleanClientMessageId(clientMessageId);
+    if (!client) return `${folder}/${uniqueMediaPublicId(playFabId)}`;
+
+    const digest = crypto
+      .createHash("sha256")
+      .update(
+        `${safeString(playFabId, 100)}|${client}|${safeString(kind, 30)}`,
+        "utf8"
+      )
+      .digest("hex");
+
+    return `${folder}/${safeMediaIdSegment(playFabId)}_${safeMediaIdSegment(
+      kind,
+      "media"
+    )}_${digest.slice(0, 40)}`;
+  }
+
+  async function tryGetExistingCloudinaryAsset(publicId, resourceType, includeModeration = false) {
+    try {
+      return await cloudinary.api.resource(publicId, {
+        resource_type: resourceType,
+        type: "upload",
+        ...(includeModeration ? { moderations: true } : {}),
+      });
+    } catch (_) {
+      return null;
+    }
   }
 
   async function destroyCloudinaryAsset(publicId, resourceType) {
@@ -2468,17 +2657,41 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     }
   }
 
-  function uploadAudioBuffer(buffer, playFabId) {
+  function uploadAudioBuffer(buffer, playFabId, clientMessageId) {
     return new Promise((resolve, reject) => {
+      const publicId = mediaPublicId(
+        VOICE_FOLDER,
+        playFabId,
+        clientMessageId,
+        "voice"
+      );
+      const deterministic = !!cleanClientMessageId(clientMessageId);
+
       const stream = cloudinary.uploader.upload_stream(
         {
           resource_type: "video",
-          folder: VOICE_FOLDER,
-          public_id: uniqueMediaPublicId(playFabId),
+          public_id: publicId,
           overwrite: false,
         },
-        (error, result) => {
-          if (error) return reject(error);
+        async (error, result) => {
+          if (error) {
+            const existing = await tryGetExistingCloudinaryAsset(
+              publicId,
+              "video",
+              false
+            );
+
+            if (existing && existing.secure_url) {
+              return resolve({
+                url: existing.secure_url,
+                publicId: existing.public_id || publicId,
+                existing: true,
+                deterministic,
+              });
+            }
+
+            return reject(error);
+          }
 
           if (!result || !result.secure_url) {
             return reject(new Error("cloudinary_no_url"));
@@ -2486,7 +2699,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
           resolve({
             url: result.secure_url,
-            publicId: result.public_id || "",
+            publicId: result.public_id || publicId,
+            existing: !!result.existing,
+            deterministic,
           });
         }
       );
@@ -2495,93 +2710,119 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     });
   }
 
-  function uploadImageBuffer(buffer, playFabId) {
+  function uploadImageBuffer(buffer, playFabId, clientMessageId) {
     return new Promise((resolve, reject) => {
+      const publicId = mediaPublicId(
+        IMAGE_FOLDER,
+        playFabId,
+        clientMessageId,
+        "image"
+      );
+      const deterministic = !!cleanClientMessageId(clientMessageId);
+
+      const finishWithResult = async (result, reusedExisting) => {
+        if (!result || !result.public_id) {
+          return reject(
+            makeChatError("IMAGE_UPLOAD_NO_RESULT", "cloudinary_image_no_result")
+          );
+        }
+
+        const actualPublicId = safeString(result.public_id, 500) || publicId;
+        const moderationStatus =
+          getModerationStatus(result, IMAGE_MODERATION_KIND) ||
+          getDeepModerationStatus(result);
+        const moderationLabels = getModerationLabels(
+          result,
+          IMAGE_MODERATION_KIND
+        );
+
+        console.log("[LuxuryChat][IMAGE_MODERATION]", {
+          playFabId: safeString(playFabId, 100),
+          publicId: actualPublicId,
+          status: moderationStatus || "missing",
+          labelsCount: moderationLabels.length,
+          existing: !!reusedExisting,
+        });
+
+        if (moderationStatus !== "approved") {
+          // لا نحذف Asset مشتركاً وصلنا إليه بسبب Retry متزامن وهو ما زال pending.
+          if (!reusedExisting || moderationStatus === "rejected") {
+            await destroyCloudinaryAsset(actualPublicId, "image");
+          }
+
+          if (moderationStatus === "rejected") {
+            return reject(
+              makeChatError(
+                "IMAGE_MODERATION_REJECTED",
+                "image_moderation_rejected",
+                { moderationStatus }
+              )
+            );
+          }
+
+          return reject(
+            makeChatError(
+              "IMAGE_MODERATION_NOT_APPROVED",
+              "image_moderation_not_approved",
+              { moderationStatus: moderationStatus || "missing" }
+            )
+          );
+        }
+
+        if (!result.secure_url) {
+          if (!reusedExisting) {
+            await destroyCloudinaryAsset(actualPublicId, "image");
+          }
+          return reject(
+            makeChatError("IMAGE_UPLOAD_NO_URL", "cloudinary_image_no_url")
+          );
+        }
+
+        const thumb = cloudinary.url(actualPublicId, {
+          resource_type: "image",
+          type: "upload",
+          secure: true,
+          transformation: [
+            {
+              width: 700,
+              height: 700,
+              crop: "limit",
+              quality: "auto:good",
+              fetch_format: "auto",
+            },
+          ],
+        });
+
+        resolve({
+          url: result.secure_url,
+          thumbnailUrl: thumb || result.secure_url,
+          publicId: actualPublicId,
+          moderationStatus,
+          existing: !!reusedExisting,
+          deterministic,
+        });
+      };
+
       const stream = cloudinary.uploader.upload_stream(
         {
           resource_type: "image",
-          folder: IMAGE_FOLDER,
-          public_id: uniqueMediaPublicId(playFabId),
+          public_id: publicId,
           overwrite: false,
           format: "jpg",
           moderation: IMAGE_MODERATION_KIND,
         },
         async (error, result) => {
-          if (error) return reject(error);
-
-          if (!result || !result.public_id) {
-            return reject(
-              makeChatError("IMAGE_UPLOAD_NO_RESULT", "cloudinary_image_no_result")
+          if (error) {
+            const existing = await tryGetExistingCloudinaryAsset(
+              publicId,
+              "image",
+              true
             );
+            if (existing) return finishWithResult(existing, true);
+            return reject(error);
           }
 
-          const publicId = safeString(result.public_id, 500);
-          const moderationStatus = getModerationStatus(
-            result,
-            IMAGE_MODERATION_KIND
-          );
-          const moderationLabels = getModerationLabels(
-            result,
-            IMAGE_MODERATION_KIND
-          );
-
-          console.log("[LuxuryChat][IMAGE_MODERATION]", {
-            playFabId: safeString(playFabId, 100),
-            publicId,
-            status: moderationStatus || "missing",
-            labelsCount: moderationLabels.length,
-          });
-
-          if (moderationStatus !== "approved") {
-            await destroyCloudinaryAsset(publicId, "image");
-
-            if (moderationStatus === "rejected") {
-              return reject(
-                makeChatError(
-                  "IMAGE_MODERATION_REJECTED",
-                  "image_moderation_rejected",
-                  { moderationStatus }
-                )
-              );
-            }
-
-            return reject(
-              makeChatError(
-                "IMAGE_MODERATION_NOT_APPROVED",
-                "image_moderation_not_approved",
-                { moderationStatus: moderationStatus || "missing" }
-              )
-            );
-          }
-
-          if (!result.secure_url) {
-            await destroyCloudinaryAsset(publicId, "image");
-            return reject(
-              makeChatError("IMAGE_UPLOAD_NO_URL", "cloudinary_image_no_url")
-            );
-          }
-
-          const thumb = cloudinary.url(result.public_id, {
-            resource_type: "image",
-            type: "upload",
-            secure: true,
-            transformation: [
-              {
-                width: 700,
-                height: 700,
-                crop: "limit",
-                quality: "auto:good",
-                fetch_format: "auto",
-              },
-            ],
-          });
-
-          resolve({
-            url: result.secure_url,
-            thumbnailUrl: thumb || result.secure_url,
-            publicId,
-            moderationStatus,
-          });
+          return finishWithResult(result, !!(result && result.existing));
         }
       );
 
@@ -2593,7 +2834,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     return new Promise((resolve, reject) => {
       const publicId =
         safeString(forcedPublicId, 500) ||
-        `${VIDEO_FOLDER}/${uniqueMediaPublicId(playFabId)}`;
+        mediaPublicId(VIDEO_FOLDER, playFabId, "", "video");
 
       const stream = cloudinary.uploader.upload_stream(
         {
@@ -2603,8 +2844,19 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           moderation: VIDEO_MODERATION_KIND,
           notification_url: VIDEO_MODERATION_WEBHOOK_URL,
         },
-        (error, result) => {
-          if (error) return reject(error);
+        async (error, result) => {
+          if (error) {
+            const existing = await tryGetExistingCloudinaryAsset(
+              publicId,
+              "video",
+              true
+            );
+            if (existing && existing.public_id && existing.secure_url) {
+              result = { ...existing, existing: true };
+            } else {
+              return reject(error);
+            }
+          }
 
           if (!result || !result.public_id || !result.secure_url) {
             return reject(
@@ -2640,6 +2892,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
               .trim()
               .toLowerCase(),
             raw: result,
+            existing: !!result.existing,
           });
         }
       );
@@ -2924,7 +3177,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     let adminResource = null;
     let adminStatus = "";
 
-    // V10: نسأل Cloudinary Admin API كلما طبقنا نتيجة نهائية؛ هو المرجع الأقوى.
+    // V11: نسأل Cloudinary Admin API كلما طبقنا نتيجة نهائية؛ هو المرجع الأقوى.
     try {
       adminResource = await getVideoModerationResource(id);
       job.lastCloudinaryCheckUnixMs = nowMs();
@@ -2966,7 +3219,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       return { status: "rejected" };
     }
 
-    // أهم إصلاح سباق V10: pending لا يستطيع إنزال حالة نهائية سابقة.
+    // أهم إصلاح سباق V11: pending لا يستطيع إنزال حالة نهائية سابقة.
     if (isTerminalVideoStatus(previousStatus)) {
       job.status = previousStatus;
       job.moderationStatus = previousModerationStatus;
@@ -3514,7 +3767,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           req.body && req.body.replyToMessageId
         );
 
-        uploaded = await uploadAudioBuffer(req.file.buffer, playFabId);
+        uploaded = await uploadAudioBuffer(
+          req.file.buffer,
+          playFabId,
+          clientMessageId
+        );
 
         let attemptedMessage = makeMessage({
           roomId,
@@ -3537,7 +3794,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           message.voiceUrl &&
           message.voiceUrl !== uploaded.url
         ) {
-          await destroyCloudinaryAsset(uploaded.publicId, "video");
+          if (!uploaded.deterministic) {
+            await destroyCloudinaryAsset(uploaded.publicId, "video");
+          }
           uploaded = null;
         }
 
@@ -3546,7 +3805,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           message,
         });
       } catch (error) {
-        if (uploaded && uploaded.publicId) {
+        if (uploaded && uploaded.publicId && !uploaded.deterministic) {
           await destroyCloudinaryAsset(uploaded.publicId, "video");
         }
 
@@ -3810,9 +4069,12 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             });
           }
 
-          const videoPublicId = `${VIDEO_FOLDER}/${uniqueMediaPublicId(
-            playFabId
-          )}`;
+          const videoPublicId = mediaPublicId(
+            VIDEO_FOLDER,
+            playFabId,
+            effectiveClientMessageId,
+            "video"
+          );
 
           const job = {
             jobId: crypto.randomUUID(),
@@ -3885,7 +4147,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
                 await enqueueVideoJobsSave();
               } catch (_) {}
 
-              await destroyCloudinaryAsset(videoPublicId, "video");
+              // إذا Unity أعطانا clientMessageId فـpublicId مشترك وحتمي بين instances.
+              // لا نحذفه هنا لأن Instance آخر قد يكون أكمل نفس الـRetry بنجاح.
+              if (!clientMessageId) {
+                await destroyCloudinaryAsset(videoPublicId, "video");
+              }
               throw error;
             }
 
@@ -3988,7 +4254,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         // IMAGE
         // ------------------------------------------------------------------
 
-        uploadedImage = await uploadImageBuffer(req.file.buffer, playFabId);
+        uploadedImage = await uploadImageBuffer(
+          req.file.buffer,
+          playFabId,
+          clientMessageId
+        );
 
         if (
           String((uploadedImage && uploadedImage.moderationStatus) || "")
@@ -4034,7 +4304,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           message.mediaUrl &&
           message.mediaUrl !== uploadedImage.url
         ) {
-          await destroyCloudinaryAsset(uploadedImage.publicId, "image");
+          if (!uploadedImage.deterministic) {
+            await destroyCloudinaryAsset(uploadedImage.publicId, "image");
+          }
           uploadedImage = null;
         }
 
@@ -4043,7 +4315,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           message,
         });
       } catch (error) {
-        if (uploadedImage && uploadedImage.publicId) {
+        if (
+          uploadedImage &&
+          uploadedImage.publicId &&
+          !uploadedImage.deterministic
+        ) {
           await destroyCloudinaryAsset(uploadedImage.publicId, "image");
         }
 
@@ -4185,7 +4461,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   console.log("[LuxuryChat] installed", {
-    version: 10,
+    version: 11,
     build: SERVER_BUILD,
     imageModeration: IMAGE_MODERATION_KIND,
     imageModerationFailClosed: true,
@@ -4196,7 +4472,10 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     persistentHistory:
       "Cloudinary raw JSON - per-process daily shards + strict full snapshots",
     historyCacheRole:
-      "runtime cache only - no shared room overwrite + stable delivery cursor",
+      "runtime cache + throttled Admin discovery + direct raw delivery refresh",
+    historyShardDiscoveryMs: HISTORY_SHARD_DISCOVERY_MS,
+    videoJobShardDiscoveryMs: VIDEO_JOB_SHARD_DISCOVERY_MS,
+    deterministicMediaPublicIds: true,
     retentionDays: RETENTION_DAYS,
     fetchLimit: MAX_FETCH_LIMIT,
     maxTextLength: MAX_TEXT_LENGTH,
