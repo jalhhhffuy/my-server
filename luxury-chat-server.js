@@ -1,7 +1,7 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V13 UNITY UTF16 / SURROGATE HISTORY SAFE
+// Luxury Chat Server - V15 PRIVATE 24H INDEX / UNITY UTF16 SAFE
 // SERVER-AUTHORITATIVE PRIVATE INBOX + 24H CONVERSATION DELIVERY
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
@@ -9,7 +9,7 @@
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // BUILD:
-// 2026-08-11-LUXURY-CHAT-SERVER-V13-UNITY-UTF16-PRIVATE-INBOX-SERVER-AUTH
+// 2026-08-11-LUXURY-CHAT-SERVER-V15-PRIVATE-24H-INDEX-STABLE
 //
 // server.js:
 // const installLuxuryChat = require("./luxury-chat-server");
@@ -55,6 +55,15 @@
 // - عند Retry لن تتكرر المحادثة أو الرسالة في Inbox.
 // - جلب inbox_ يجلب صور اللاعبين تلقائياً حتى لو Unity لم يطلب refreshProfiles.
 // - في حدث "رسالتي" يعيد السيرفر Profile الطرف الآخر حتى تظهر صورته في قائمة المحادثات.
+//
+// V15 - نظام جديد لقائمة الخاص آخر 24 ساعة:
+// - /chat/private-inbox يعيد ملخص المحادثات مباشرة، ولا يعتمد على آخر 100 رسالة.
+// - آخر رسالة هي التي تعيد عداد 24 ساعة؛ بعد 24 ساعة بدون رسالة تختفي المحادثة.
+// - يدعم حتى 2000 محادثة نشطة في الرد الواحد.
+// - لا ينفذ مئات طلبات PlayFab عند كل Poll؛ الاسم والصورة يؤخذان من Inbox Events نفسها.
+// - حدث المرسل على السيرفر يحمل Profile الطرف الآخر، لذلك الصورة تبقى صحيحة حتى لو المحادثة بدأت بإرسال فقط.
+// - unreadCount يحسب من Inbox Events و Read Markers على السيرفر.
+// - لا يغيّر تخزين الشات العام/القبيلة/الخاص ولا احتفاظ 30 يوماً.
 // ============================================================================
 
 const multer = require("multer");
@@ -70,7 +79,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-11-LUXURY-CHAT-SERVER-V13-UNITY-UTF16-PRIVATE-INBOX-SERVER-AUTH";
+    "2026-08-11-LUXURY-CHAT-SERVER-V15-PRIVATE-24H-INDEX-STABLE";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -88,6 +97,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // نفس Tokens الموجودة في LuxuryPrivateChatManager الحالي.
   const PRIVATE_INBOX_EVENT_TOKEN = "__LPI1__";
   const PRIVATE_INBOX_READ_TOKEN = "__LPIR1__";
+
+  const PRIVATE_INBOX_ACTIVE_HOURS = 24;
+  const MAX_PRIVATE_INBOX_CONVERSATIONS = 2000;
 
   const PRIVATE_INBOX_MIRROR_RETRY_DELAYS_MS = [
     0,
@@ -1166,6 +1178,405 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     };
   }
 
+  function parsePrivateInboxReadMarkerText(
+    value
+  ) {
+    const text =
+      sanitizeUnicodeString(
+        value
+      );
+
+    if (
+      !text.startsWith(
+        `${PRIVATE_INBOX_READ_TOKEN}|`
+      )
+    ) {
+      return null;
+    }
+
+    const parts =
+      text.split(
+        "|"
+      );
+
+    if (parts.length < 3)
+      return null;
+
+    const peerId =
+      canonicalPrivatePlayerId(
+        parts[1]
+      );
+
+    const upToSeq =
+      Math.max(
+        0,
+        Number(
+          parts[2]
+        ) || 0
+      );
+
+    if (!peerId || upToSeq <= 0)
+      return null;
+
+    return {
+      peerId,
+      upToSeq,
+    };
+  }
+
+  function buildPrivateInbox24HourSnapshot(
+    room,
+    ownerPlayFabId,
+    requestedHours,
+    requestedLimit
+  ) {
+    const ownerId =
+      canonicalPrivatePlayerId(
+        ownerPlayFabId
+      );
+
+    const lifetimeHours =
+      Math.max(
+        1,
+        Math.min(
+          PRIVATE_INBOX_ACTIVE_HOURS,
+          Number(
+            requestedHours
+          ) || PRIVATE_INBOX_ACTIVE_HOURS
+        )
+      );
+
+    const maxConversations =
+      Math.max(
+        1,
+        Math.min(
+          MAX_PRIVATE_INBOX_CONVERSATIONS,
+          Number(
+            requestedLimit
+          ) || MAX_PRIVATE_INBOX_CONVERSATIONS
+        )
+      );
+
+    const serverNowUnixMs =
+      nowMs();
+
+    const cutoffUnixMs =
+      serverNowUnixMs -
+      lifetimeHours *
+        60 *
+        60 *
+        1000;
+
+    const messages =
+      Array.isArray(
+        room &&
+        room.messages
+      )
+        ? room.messages
+            .map(
+              (message) =>
+                normalizeMessage(
+                  message,
+                  room.id
+                )
+            )
+            .filter(Boolean)
+            .sort(compareMessages)
+        : [];
+
+    // نحتاج فقط أحداث/علامات آخر 24 ساعة لأن أي محادثة أقدم من ذلك غير نشطة أصلاً.
+    const recent = [];
+
+    for (
+      let i =
+        messages.length - 1;
+      i >= 0;
+      i--
+    ) {
+      const message =
+        messages[i];
+
+      const sentUnixMs =
+        Math.max(
+          0,
+          Number(
+            message &&
+            message.sentUnixMs
+          ) || 0
+        );
+
+      if (
+        sentUnixMs > 0 &&
+        sentUnixMs < cutoffUnixMs
+      ) {
+        break;
+      }
+
+      recent.push(
+        message
+      );
+    }
+
+    recent.reverse();
+
+    const latestReadByPeer =
+      new Map();
+
+    for (
+      const message
+      of recent
+    ) {
+      const marker =
+        parsePrivateInboxReadMarkerText(
+          message &&
+          message.text
+        );
+
+      if (!marker)
+        continue;
+
+      const previous =
+        latestReadByPeer.get(
+          marker.peerId
+        ) || 0;
+
+      if (
+        marker.upToSeq >
+        previous
+      ) {
+        latestReadByPeer.set(
+          marker.peerId,
+          marker.upToSeq
+        );
+      }
+    }
+
+    const byPeer =
+      new Map();
+
+    for (
+      const message
+      of recent
+    ) {
+      const event =
+        parsePrivateInboxEventText(
+          message &&
+          message.text
+        );
+
+      if (!event)
+        continue;
+
+      const peerId =
+        canonicalPrivatePlayerId(
+          event.peerId
+        );
+
+      if (
+        !peerId ||
+        peerId === ownerId
+      ) {
+        continue;
+      }
+
+      const sentUnixMs =
+        Math.max(
+          0,
+          Number(
+            message.sentUnixMs
+          ) || 0
+        );
+
+      if (
+        sentUnixMs <= 0 ||
+        sentUnixMs < cutoffUnixMs
+      ) {
+        continue;
+      }
+
+      const seq =
+        Math.max(
+          0,
+          Number(
+            message.seq
+          ) || 0
+        );
+
+      let item =
+        byPeer.get(
+          peerId
+        );
+
+      if (!item) {
+        item = {
+          peerId,
+          peerName:
+            safeString(
+              event.peerName,
+              64
+            ) || "لاعب",
+          preview:
+            safeString(
+              event.preview,
+              120
+            ),
+          kind:
+            safeString(
+              event.kind,
+              30
+            ) || "text",
+          peerAvatarUrl:
+            "",
+          peerAvatarVersion:
+            "0",
+          lastActivityUnixMs:
+            0,
+          lastInboxEventSeq:
+            0,
+          unreadCount:
+            0,
+          lastMessageMine:
+            !!event.mineEvent,
+          _latestKey:
+            "",
+        };
+
+        byPeer.set(
+          peerId,
+          item
+        );
+      }
+
+      const readSeq =
+        latestReadByPeer.get(
+          peerId
+        ) || 0;
+
+      if (
+        !event.mineEvent &&
+        seq > readSeq
+      ) {
+        item.unreadCount += 1;
+      }
+
+      const latestKey =
+        `${String(sentUnixMs).padStart(16, "0")}|${String(seq).padStart(20, "0")}|${safeString(message.id, 120)}`;
+
+      if (
+        !item._latestKey ||
+        latestKey >=
+          item._latestKey
+      ) {
+        item._latestKey =
+          latestKey;
+
+        item.peerName =
+          safeString(
+            event.peerName,
+            64
+          ) ||
+          item.peerName ||
+          "لاعب";
+
+        item.preview =
+          safeString(
+            event.preview,
+            120
+          );
+
+        item.kind =
+          safeString(
+            event.kind,
+            30
+          ) || "text";
+
+        item.lastActivityUnixMs =
+          sentUnixMs;
+
+        item.lastInboxEventSeq =
+          seq;
+
+        item.lastMessageMine =
+          !!event.mineEvent;
+      }
+
+      // الحدث الوارد يحمل Profile الطرف الآخر مباشرة.
+      // حدث المرسل الجديد في V15 أيضاً يحمل Profile الطرف الآخر من السيرفر.
+      const canUseMessageProfile =
+        !event.mineEvent ||
+        String(
+          message.clientMessageId || ""
+        ).startsWith(
+          "lpim_me_"
+        );
+
+      if (
+        canUseMessageProfile &&
+        message.senderAvatarUrl
+      ) {
+        item.peerAvatarUrl =
+          safeString(
+            message.senderAvatarUrl,
+            1000
+          );
+
+        item.peerAvatarVersion =
+          safeString(
+            message.senderAvatarVersion,
+            100
+          ) || "0";
+      }
+    }
+
+    const conversations =
+      Array.from(
+        byPeer.values()
+      )
+        .sort(
+          (a, b) => {
+            const timeDiff =
+              Number(
+                b.lastActivityUnixMs
+              ) -
+              Number(
+                a.lastActivityUnixMs
+              );
+
+            if (timeDiff !== 0)
+              return timeDiff;
+
+            return String(
+              a.peerId || ""
+            ).localeCompare(
+              String(
+                b.peerId || ""
+              )
+            );
+          }
+        )
+        .slice(
+          0,
+          maxConversations
+        );
+
+    for (
+      const item
+      of conversations
+    ) {
+      delete item._latestKey;
+    }
+
+    return {
+      conversations:
+        sanitizeJsonForUnity(
+          conversations
+        ),
+      serverNowUnixMs,
+      lifetimeHours,
+      maxConversations,
+    };
+  }
+
   function stablePrivateInboxToken(
     value
   ) {
@@ -1446,8 +1857,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         senderId:
           sourceMessage.senderId,
 
+        // V15: داخل Inbox المرسل نحتاج صورة الطرف الآخر، لا صورة صاحب الحساب.
         profile:
-          senderProfile,
+          peerProfile,
 
         kind:
           "text",
@@ -10119,6 +10531,105 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   }
 
   // ========================================================================
+  // PRIVATE INBOX INDEX - LAST 24 HOURS
+  // ========================================================================
+
+  app.post(
+    "/chat/private-inbox",
+    async (
+      req,
+      res
+    ) => {
+      try {
+        const playFabId =
+          await authenticateSessionTicket(
+            req.body &&
+            req.body.sessionTicket
+          );
+
+        const inboxRoom =
+          buildPrivateInboxRoomId(
+            playFabId
+          );
+
+        if (!inboxRoom) {
+          return res
+            .status(400)
+            .json({
+              ok:
+                false,
+              error:
+                "تعذر تحديد صندوق الدردشات الخاصة",
+            });
+        }
+
+        const room =
+          await ensureRoomLoaded(
+            inboxRoom,
+            {
+              // Poll Unity كل نصف ثانية تقريباً؛ لا نعمل Force Cloudinary في كل طلب.
+              forceStorageRefresh:
+                false,
+            }
+          );
+
+        pruneExpired(room);
+        dedupeClientMessages(room);
+        repairSequenceCollisions(room);
+
+        const snapshot =
+          buildPrivateInbox24HourSnapshot(
+            room,
+            playFabId,
+            req.body &&
+            req.body.lifetimeHours,
+            req.body &&
+            req.body.maxConversations
+          );
+
+        return res.json(
+          sanitizeJsonForUnity({
+            ok:
+              true,
+            conversations:
+              snapshot.conversations,
+            serverNowUnixMs:
+              snapshot.serverNowUnixMs,
+            lifetimeHours:
+              snapshot.lifetimeHours,
+            maxConversations:
+              snapshot.maxConversations,
+            count:
+              snapshot.conversations.length,
+            source:
+              "private-inbox-24h-index-v15",
+            build:
+              SERVER_BUILD,
+          })
+        );
+      } catch (error) {
+        console.error(
+          "/chat/private-inbox",
+          error
+        );
+
+        return res
+          .status(500)
+          .json(
+            sanitizeJsonForUnity({
+              ok:
+                false,
+              error:
+                "تعذر تحميل قائمة الدردشات الخاصة",
+              build:
+                SERVER_BUILD,
+            })
+          );
+      }
+    }
+  );
+
+  // ========================================================================
   // HISTORY
   // ========================================================================
 
@@ -12099,7 +12610,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     "[LuxuryChat] installed",
     {
       version:
-        13,
+        15,
 
       build:
         SERVER_BUILD,
@@ -12149,6 +12660,12 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       deterministicMediaPublicIds:
         true,
 
+      privateInbox24HourIndex:
+        true,
+
+      privateInboxMaxConversations:
+        MAX_PRIVATE_INBOX_CONVERSATIONS,
+
       retentionDays:
         RETENTION_DAYS,
 
@@ -12177,6 +12694,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         REPORTS_KEY,
 
       routes: [
+        "/chat/private-inbox",
         "/chat/messages",
         "/chat/send",
         "/chat/voice",
