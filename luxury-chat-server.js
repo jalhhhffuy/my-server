@@ -1,7 +1,7 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V18 PRIVATE 24H PERSISTENT INDEX / AUTH TRACE / UNITY UTF16 SAFE
+// Luxury Chat Server - V19 PRIVATE PRESENCE / READ ZERO / 24H PERSISTENT INDEX
 // SERVER-AUTHORITATIVE PRIVATE INBOX + 24H CONVERSATION DELIVERY
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
@@ -77,6 +77,11 @@
 // - /chat/private-inbox يقرأ هذا الفهرس الدائم في كل مرة، ثم يدمجه مع inbox_ ومع Repair القديم.
 // - المحادثات القديمة خلال آخر 24 ساعة يتم Backfill لها إلى الفهرس تلقائياً عند أول دخول.
 // - لا يوجد ملف Inbox واحد مشترك يتم الكتابة فوقه؛ كل زوج لاعب/طرف له ملف مستقل.
+//
+// V19:
+// - Presence من السيرفر: أخضر إذا وصل نشاط شات خلال آخر 35 ثانية، وإلا أحمر.
+// - فتح المحادثة يثبت unreadCount=0 على السيرفر عبر /chat/private-inbox/read.
+// - Snapshot يبقى مرتباً حسب أحدث lastActivityUnixMs، وأي رسالة جديدة ترفع المحادثة للأعلى.
 // ============================================================================
 
 const multer = require("multer");
@@ -92,7 +97,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-11-LUXURY-CHAT-SERVER-V18-PRIVATE-24H-AUTH-TRACE-PAIR-INDEX";
+    "2026-08-11-LUXURY-CHAT-SERVER-V19-PRIVATE-PRESENCE-READ-ZERO-SORT";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -113,6 +118,10 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
   const PRIVATE_INBOX_ACTIVE_HOURS = 24;
   const MAX_PRIVATE_INBOX_CONVERSATIONS = 2000;
+
+  // V19: متصل إذا وصل من اللاعب طلب شات خلال آخر 35 ثانية.
+  const PRIVATE_PRESENCE_ONLINE_WINDOW_MS =
+    35 * 1000;
 
   // V16: إصلاح ذاتي من تاريخ غرف الخاص الفعلية.
   const PRIVATE_INBOX_REPAIR_CACHE_MS = 60 * 1000;
@@ -345,6 +354,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   const privateConversationIndexCache = new Map();
   const privateConversationIndexWriteChains = new Map();
   const PRIVATE_CONVERSATION_INDEX_CACHE_MS = 1500;
+
+  // V19: Presence من السيرفر.
+  const privatePresenceLastSeenUnixMs = new Map();
 
   const sendRate = new Map();
   const reportRate = new Map();
@@ -837,6 +849,123 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     return "text";
   }
 
+
+  // ========================================================================
+  // V19 - PRIVATE PRESENCE
+  // ========================================================================
+
+  function touchPrivatePresence(
+    playFabId
+  ) {
+    const id =
+      canonicalPrivatePlayerId(
+        playFabId
+      );
+
+    if (!id)
+      return 0;
+
+    const seen =
+      nowMs();
+
+    privatePresenceLastSeenUnixMs.set(
+      id,
+      seen
+    );
+
+    return seen;
+  }
+
+  function getPrivatePresenceLastSeen(
+    playFabId
+  ) {
+    const id =
+      canonicalPrivatePlayerId(
+        playFabId
+      );
+
+    if (!id)
+      return 0;
+
+    return Math.max(
+      0,
+      Number(
+        privatePresenceLastSeenUnixMs.get(
+          id
+        )
+      ) || 0
+    );
+  }
+
+  function isPrivatePlayerOnline(
+    playFabId,
+    serverNowUnixMs
+  ) {
+    const lastSeen =
+      getPrivatePresenceLastSeen(
+        playFabId
+      );
+
+    if (lastSeen <= 0)
+      return false;
+
+    const current =
+      Math.max(
+        1,
+        Number(
+          serverNowUnixMs
+        ) || nowMs()
+      );
+
+    return (
+      current - lastSeen <=
+      PRIVATE_PRESENCE_ONLINE_WINDOW_MS
+    );
+  }
+
+  function decoratePrivateInboxWithPresence(
+    conversations,
+    serverNowUnixMs
+  ) {
+    const current =
+      Math.max(
+        1,
+        Number(
+          serverNowUnixMs
+        ) || nowMs()
+      );
+
+    return (
+      Array.isArray(
+        conversations
+      )
+        ? conversations
+        : []
+    ).map(
+      (item) => {
+        const peerId =
+          canonicalPrivatePlayerId(
+            item &&
+            item.peerId
+          );
+
+        const lastSeenUnixMs =
+          getPrivatePresenceLastSeen(
+            peerId
+          );
+
+        return {
+          ...(item || {}),
+          isOnline:
+            isPrivatePlayerOnline(
+              peerId,
+              current
+            ),
+          lastSeenUnixMs,
+        };
+      }
+    );
+  }
 
   // ========================================================================
   // PRIVATE INBOX - SERVER AUTHORITATIVE
@@ -12640,6 +12769,10 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             req.body.sessionTicket
           );
 
+        touchPrivatePresence(
+          playFabId
+        );
+
         const inboxRoom =
           buildPrivateInboxRoomId(
             playFabId
@@ -12764,11 +12897,17 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             snapshot.maxConversations
           );
 
-        const conversations =
+        const mergedConversations =
           mergePrivateInboxConversationLists(
             snapshotPlusIndex,
             recovered,
             snapshot.maxConversations
+          );
+
+        const conversations =
+          decoratePrivateInboxWithPresence(
+            mergedConversations,
+            snapshot.serverNowUnixMs
           );
 
         console.log(
@@ -12851,6 +12990,255 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   );
 
   // ========================================================================
+  // V19 - PRIVATE INBOX READ RECEIPT
+  // ========================================================================
+
+  app.post(
+    "/chat/private-inbox/read",
+    async (
+      req,
+      res
+    ) => {
+      try {
+        const playFabId =
+          await authenticateSessionTicket(
+            req.body &&
+            req.body.sessionTicket
+          );
+
+        touchPrivatePresence(
+          playFabId
+        );
+
+        const ownerId =
+          canonicalPrivatePlayerId(
+            playFabId
+          );
+
+        const peerId =
+          canonicalPrivatePlayerId(
+            req.body &&
+            req.body.peerId
+          );
+
+        if (
+          !ownerId ||
+          !peerId ||
+          ownerId === peerId
+        ) {
+          return res
+            .status(400)
+            .json({
+              ok: false,
+              error:
+                "معرف المحادثة الخاصة غير صالح",
+            });
+        }
+
+        const inboxRoom =
+          buildPrivateInboxRoomId(
+            ownerId
+          );
+
+        const room =
+          await ensureRoomLoaded(
+            inboxRoom,
+            {
+              forceStorageRefresh:
+                true,
+            }
+          );
+
+        pruneExpired(room);
+        dedupeClientMessages(room);
+        repairSequenceCollisions(room);
+
+        const snapshot =
+          buildPrivateInbox24HourSnapshot(
+            room,
+            ownerId,
+            PRIVATE_INBOX_ACTIVE_HOURS,
+            MAX_PRIVATE_INBOX_CONVERSATIONS
+          );
+
+        const current =
+          (
+            Array.isArray(
+              snapshot.conversations
+            )
+              ? snapshot.conversations
+              : []
+          ).find(
+            (item) =>
+              canonicalPrivatePlayerId(
+                item &&
+                item.peerId
+              ) === peerId
+          ) || null;
+
+        const indexed =
+          await loadPrivateConversationIndex(
+            ownerId,
+            MAX_PRIVATE_INBOX_CONVERSATIONS
+          );
+
+        const indexedCurrent =
+          (
+            Array.isArray(
+              indexed
+            )
+              ? indexed
+              : []
+          ).find(
+            (item) =>
+              canonicalPrivatePlayerId(
+                item &&
+                item.peerId
+              ) === peerId
+          ) || null;
+
+        const best =
+          (
+            current &&
+            indexedCurrent
+          )
+            ? (
+                Number(
+                  current.lastActivityUnixMs
+                ) >=
+                Number(
+                  indexedCurrent.lastActivityUnixMs
+                )
+                  ? current
+                  : indexedCurrent
+              )
+            : (
+                current ||
+                indexedCurrent
+              );
+
+        if (best) {
+          await enqueuePrivateConversationIndexMarker(
+            ownerId,
+            peerId,
+            {
+              playerName:
+                best.peerName,
+              avatarUrl:
+                best.peerAvatarUrl,
+              avatarVersion:
+                best.peerAvatarVersion,
+            },
+            best.kind,
+            best.preview,
+            best.lastActivityUnixMs,
+            !!best.lastMessageMine,
+            "",
+            0
+          );
+        }
+
+        const upToSeq =
+          Math.max(
+            0,
+            Number(
+              current &&
+              current.lastInboxEventSeq
+            ) || 0
+          );
+
+        if (
+          inboxRoom &&
+          upToSeq > 0
+        ) {
+          const profile =
+            await getPlayerProfile(
+              ownerId,
+              false
+            );
+
+          let readMessage =
+            makeMessage({
+              roomId:
+                inboxRoom,
+              senderId:
+                ownerId,
+              profile,
+              kind:
+                "text",
+              reply:
+                null,
+              clientMessageId:
+                `lpir_srv_${stablePrivateInboxToken(
+                  `${ownerId}|${peerId}|${upToSeq}`
+                )}`,
+            });
+
+          readMessage.sentUnixMs =
+            nowMs();
+
+          readMessage.text =
+            [
+              PRIVATE_INBOX_READ_TOKEN,
+              peerId,
+              String(
+                upToSeq
+              ),
+            ].join("|");
+
+          await pushPrivateInboxEventWithRetry(
+            inboxRoom,
+            readMessage
+          );
+        }
+
+        privateConversationIndexCache.delete(
+          ownerId
+        );
+
+        console.log(
+          "[LuxuryChat][PRIVATE_INBOX][READ_ZERO]",
+          {
+            ownerId,
+            peerId,
+            upToSeq,
+            build:
+              SERVER_BUILD,
+          }
+        );
+
+        return res.json({
+          ok:
+            true,
+          peerId,
+          unreadCount:
+            0,
+          serverNowUnixMs:
+            nowMs(),
+          build:
+            SERVER_BUILD,
+        });
+      } catch (error) {
+        console.error(
+          "/chat/private-inbox/read",
+          error
+        );
+
+        return res
+          .status(500)
+          .json({
+            ok:
+              false,
+            error:
+              "تعذر تثبيت قراءة المحادثة الخاصة",
+            build:
+              SERVER_BUILD,
+          });
+      }
+    }
+  );
+
+  // ========================================================================
   // HISTORY
   // ========================================================================
 
@@ -12861,9 +13249,14 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       res
     ) => {
       try {
-        await authenticateSessionTicket(
-          req.body &&
-          req.body.sessionTicket
+        const playFabId =
+          await authenticateSessionTicket(
+            req.body &&
+            req.body.sessionTicket
+          );
+
+        touchPrivatePresence(
+          playFabId
         );
 
         const roomId =
@@ -13011,6 +13404,10 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             req.body &&
             req.body.sessionTicket
           );
+
+        touchPrivatePresence(
+          playFabId
+        );
 
         const roomId =
           cleanRoom(
