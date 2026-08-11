@@ -1,7 +1,7 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V16 PRIVATE 24H SELF-HEAL / UNITY UTF16 SAFE
+// Luxury Chat Server - V17 PRIVATE 24H PERSISTENT INDEX / UNITY UTF16 SAFE
 // SERVER-AUTHORITATIVE PRIVATE INBOX + 24H CONVERSATION DELIVERY
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
@@ -9,7 +9,7 @@
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // BUILD:
-// 2026-08-11-LUXURY-CHAT-SERVER-V16-PRIVATE-24H-SELF-HEAL-STABLE
+// 2026-08-11-LUXURY-CHAT-SERVER-V17-PRIVATE-24H-PERSISTENT-PAIR-INDEX
 //
 // server.js:
 // const installLuxuryChat = require("./luxury-chat-server");
@@ -69,9 +69,14 @@
 // - أول طلب Inbox بعد تسجيل الدخول يستطيع Repair من غرف الخاص الحقيقية نفسها.
 // - إذا كانت inbox_ ناقصة أو لم تكن موجودة في إصدار أقدم، نستخرج آخر نشاط خلال 24 ساعة
 //   من Shards الخاصة الفعلية ونضمها إلى القائمة فوراً.
-// - هذا يصلح المحادثات التي أُرسلت قبل تركيب نظام Inbox الجديد طالما آخر رسالة خلال 24 ساعة.
-// - Repair مخزن مؤقتاً على السيرفر ولا يعاد كل نصف ثانية.
-// - Snapshot العادي يبقى خفيفاً ويقرأ inbox_ كما هو.
+//
+// V17 - الإصلاح النهائي لقائمة آخر 24 ساعة:
+// - لا نعتمد على Runtime ولا على inbox_ وحده لكي تبقى المحادثة بعد إغلاق اللعبة.
+// - لكل لاعب/طرف Marker مستقل دائم في Cloudinary داخل luxury_chat_private_index_v17.
+// - أي رسالة خاصة ناجحة تحدث Marker للمرسل وMarker للمستقبل بنفس وقت آخر رسالة.
+// - /chat/private-inbox يقرأ هذا الفهرس الدائم في كل مرة، ثم يدمجه مع inbox_ ومع Repair القديم.
+// - المحادثات القديمة خلال آخر 24 ساعة يتم Backfill لها إلى الفهرس تلقائياً عند أول دخول.
+// - لا يوجد ملف Inbox واحد مشترك يتم الكتابة فوقه؛ كل زوج لاعب/طرف له ملف مستقل.
 // ============================================================================
 
 const multer = require("multer");
@@ -87,7 +92,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-11-LUXURY-CHAT-SERVER-V16-PRIVATE-24H-SELF-HEAL-STABLE";
+    "2026-08-11-LUXURY-CHAT-SERVER-V17-PRIVATE-24H-PERSISTENT-PAIR-INDEX";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -114,6 +119,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   const PRIVATE_INBOX_REPAIR_MAX_RESOURCES = 12000;
   const PRIVATE_INBOX_REPAIR_SCAN_DAYS = 3;
   const PRIVATE_INBOX_REPAIR_CONCURRENCY = 8;
+
+  // V17: فهرس دائم مستقل لكل لاعب/طرف. هذا هو المصدر الأساسي لقائمة 24 ساعة.
+  const PRIVATE_CONVERSATION_INDEX_FOLDER =
+    "luxury_chat_private_index_v17";
+  const PRIVATE_CONVERSATION_INDEX_SCHEMA = 17;
+  const PRIVATE_CONVERSATION_INDEX_MAX_RESOURCES = 2500;
+  const PRIVATE_CONVERSATION_INDEX_FETCH_CONCURRENCY = 12;
 
   const PRIVATE_INBOX_MIRROR_RETRY_DELAYS_MS = [
     0,
@@ -327,6 +339,12 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ownerPlayFabId(lowercase) -> { expires, promise, conversations }
   // Repair لا يعتمد على Runtime Unity؛ مصدره Cloudinary history الحقيقي.
   const privateInboxRepairCache = new Map();
+
+  // V17: Cache قصير جداً للفهرس الدائم حتى لا نضرب Cloudinary كل 0.5 ثانية.
+  // أي رسالة خاصة جديدة تمسح Cache للطرفين فوراً.
+  const privateConversationIndexCache = new Map();
+  const privateConversationIndexWriteChains = new Map();
+  const PRIVATE_CONVERSATION_INDEX_CACHE_MS = 1500;
 
   const sendRate = new Map();
   const reportRate = new Map();
@@ -1595,6 +1613,827 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     };
   }
 
+
+  // ========================================================================
+  // V17 - PERSISTENT PRIVATE CONVERSATION PAIR INDEX
+  // ========================================================================
+
+  function privateConversationIndexPrefix(
+    ownerPlayFabId
+  ) {
+    const ownerId =
+      canonicalPrivatePlayerId(
+        ownerPlayFabId
+      );
+
+    if (!ownerId)
+      return "";
+
+    return `${PRIVATE_CONVERSATION_INDEX_FOLDER}/${ownerId}/`;
+  }
+
+  function privateConversationIndexPublicId(
+    ownerPlayFabId,
+    peerPlayFabId
+  ) {
+    const ownerId =
+      canonicalPrivatePlayerId(
+        ownerPlayFabId
+      );
+
+    const peerId =
+      canonicalPrivatePlayerId(
+        peerPlayFabId
+      );
+
+    if (
+      !ownerId ||
+      !peerId ||
+      ownerId === peerId
+    ) {
+      return "";
+    }
+
+    return `${privateConversationIndexPrefix(
+      ownerId
+    )}${peerId}.json`;
+  }
+
+  async function writePrivateConversationIndexMarker(
+    ownerPlayFabId,
+    peerPlayFabId,
+    peerProfile,
+    kind,
+    preview,
+    sentUnixMs,
+    lastMessageMine,
+    sourceMessageId,
+    unreadCount
+  ) {
+    const ownerId =
+      canonicalPrivatePlayerId(
+        ownerPlayFabId
+      );
+
+    const peerId =
+      canonicalPrivatePlayerId(
+        peerPlayFabId
+      );
+
+    const publicId =
+      privateConversationIndexPublicId(
+        ownerId,
+        peerId
+      );
+
+    if (!publicId) {
+      return {
+        ok: false,
+        reason:
+          "private_index_invalid_ids",
+      };
+    }
+
+    const activityUnixMs =
+      Math.max(
+        1,
+        Number(
+          sentUnixMs
+        ) ||
+        nowMs()
+      );
+
+    const profile =
+      peerProfile &&
+      typeof peerProfile ===
+        "object"
+        ? peerProfile
+        : {};
+
+    const document =
+      sanitizeJsonForUnity({
+        schema:
+          PRIVATE_CONVERSATION_INDEX_SCHEMA,
+
+        ownerId,
+        peerId,
+
+        peerName:
+          safeString(
+            profile.playerName,
+            64
+          ) ||
+          "لاعب",
+
+        peerAvatarUrl:
+          safeString(
+            profile.avatarUrl,
+            1000
+          ),
+
+        peerAvatarVersion:
+          safeString(
+            profile.avatarVersion,
+            100
+          ) ||
+          "0",
+
+        kind:
+          safeString(
+            kind,
+            30
+          ) ||
+          "text",
+
+        preview:
+          safeString(
+            preview,
+            120
+          ),
+
+        lastActivityUnixMs:
+          activityUnixMs,
+
+        lastMessageMine:
+          !!lastMessageMine,
+
+        unreadCount:
+          Math.max(
+            0,
+            Number(
+              unreadCount
+            ) || 0
+          ),
+
+        sourceMessageId:
+          safeString(
+            sourceMessageId,
+            120
+          ),
+
+        updatedAtUnixMs:
+          nowMs(),
+      });
+
+    const result =
+      await uploadRawJson(
+        publicId,
+        document
+      );
+
+    privateConversationIndexCache.delete(
+      ownerId
+    );
+
+    return {
+      ok:
+        true,
+
+      publicId,
+
+      secureUrl:
+        result &&
+        result.secure_url
+          ? safeString(
+              result.secure_url,
+              1800
+            )
+          : "",
+    };
+  }
+
+
+  function enqueuePrivateConversationIndexMarker(
+    ownerPlayFabId,
+    peerPlayFabId,
+    peerProfile,
+    kind,
+    preview,
+    sentUnixMs,
+    lastMessageMine,
+    sourceMessageId,
+    unreadCount
+  ) {
+    const ownerId =
+      canonicalPrivatePlayerId(
+        ownerPlayFabId
+      );
+
+    const peerId =
+      canonicalPrivatePlayerId(
+        peerPlayFabId
+      );
+
+    if (
+      !ownerId ||
+      !peerId ||
+      ownerId === peerId
+    ) {
+      return Promise.resolve({
+        ok: false,
+        reason:
+          "private_index_invalid_ids",
+      });
+    }
+
+    const key =
+      `${ownerId}|${peerId}`;
+
+    const previous =
+      privateConversationIndexWriteChains.get(
+        key
+      ) ||
+      Promise.resolve();
+
+    const next =
+      previous
+        .catch(
+          () => {}
+        )
+        .then(
+          () =>
+            writePrivateConversationIndexMarker(
+              ownerId,
+              peerId,
+              peerProfile,
+              kind,
+              preview,
+              sentUnixMs,
+              lastMessageMine,
+              sourceMessageId,
+              unreadCount
+            )
+        );
+
+    const cleanup =
+      next.finally(
+        () => {
+          if (
+            privateConversationIndexWriteChains.get(
+              key
+            ) === cleanup
+          ) {
+            privateConversationIndexWriteChains.delete(
+              key
+            );
+          }
+        }
+      );
+
+    privateConversationIndexWriteChains.set(
+      key,
+      cleanup
+    );
+
+    return cleanup;
+  }
+
+  async function readPrivateConversationIndexMarker(
+    resource
+  ) {
+    if (
+      !resource ||
+      !resource.secureUrl
+    ) {
+      return null;
+    }
+
+    try {
+      const response =
+        await fetchWithTimeout(
+          addCacheBust(
+            resource.secureUrl
+          ),
+          {
+            method:
+              "GET",
+
+            headers: {
+              "Cache-Control":
+                "no-cache, no-store, max-age=0",
+
+              Pragma:
+                "no-cache",
+            },
+          }
+        );
+
+      if (!response.ok)
+        return null;
+
+      const rawText =
+        await response.text();
+
+      const parsed =
+        JSON.parse(
+          rawText
+        );
+
+      return parsed &&
+        typeof parsed ===
+          "object"
+        ? parsed
+        : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function listPrivateConversationIndexResources(
+    ownerPlayFabId,
+    maximumResources
+  ) {
+    const prefix =
+      privateConversationIndexPrefix(
+        ownerPlayFabId
+      );
+
+    if (!prefix)
+      return [];
+
+    const resources = [];
+
+    const hardLimit =
+      Math.max(
+        1,
+        Math.min(
+          PRIVATE_CONVERSATION_INDEX_MAX_RESOURCES,
+          Number(
+            maximumResources
+          ) ||
+            PRIVATE_CONVERSATION_INDEX_MAX_RESOURCES
+        )
+      );
+
+    let nextCursor =
+      undefined;
+
+    do {
+      const result =
+        await cloudinary.api.resources(
+          {
+            resource_type:
+              "raw",
+
+            type:
+              "upload",
+
+            prefix,
+
+            max_results:
+              Math.min(
+                500,
+                hardLimit -
+                  resources.length
+              ),
+
+            ...(nextCursor
+              ? {
+                  next_cursor:
+                    nextCursor,
+                }
+              : {}),
+          }
+        );
+
+      if (
+        result &&
+        Array.isArray(
+          result.resources
+        )
+      ) {
+        for (
+          const resource
+          of result.resources
+        ) {
+          if (
+            !resource ||
+            !resource.public_id ||
+            !resource.secure_url
+          ) {
+            continue;
+          }
+
+          resources.push({
+            publicId:
+              safeString(
+                resource.public_id,
+                1000
+              ),
+
+            secureUrl:
+              safeString(
+                resource.secure_url,
+                1800
+              ),
+
+            version:
+              Math.max(
+                0,
+                Number(
+                  resource.version
+                ) || 0
+              ),
+
+            createdAt:
+              safeString(
+                resource.created_at,
+                80
+              ),
+          });
+
+          if (
+            resources.length >=
+            hardLimit
+          ) {
+            break;
+          }
+        }
+      }
+
+      nextCursor =
+        result &&
+        result.next_cursor
+          ? result.next_cursor
+          : undefined;
+    } while (
+      nextCursor &&
+      resources.length <
+        hardLimit
+    );
+
+    return resources;
+  }
+
+  async function mapPrivateIndexWithConcurrency(
+    items,
+    worker
+  ) {
+    const source =
+      Array.isArray(
+        items
+      )
+        ? items
+        : [];
+
+    const results =
+      new Array(
+        source.length
+      );
+
+    let index = 0;
+
+    async function runner() {
+      while (true) {
+        const current =
+          index++;
+
+        if (
+          current >=
+          source.length
+        ) {
+          return;
+        }
+
+        try {
+          results[current] =
+            await worker(
+              source[current],
+              current
+            );
+        } catch (_) {
+          results[current] =
+            null;
+        }
+      }
+    }
+
+    const workerCount =
+      Math.max(
+        1,
+        Math.min(
+          PRIVATE_CONVERSATION_INDEX_FETCH_CONCURRENCY,
+          source.length || 1
+        )
+      );
+
+    await Promise.all(
+      Array.from(
+        {
+          length:
+            workerCount,
+        },
+        () =>
+          runner()
+      )
+    );
+
+    return results;
+  }
+
+  async function loadPrivateConversationIndex(
+    ownerPlayFabId,
+    requestedLimit
+  ) {
+    const ownerId =
+      canonicalPrivatePlayerId(
+        ownerPlayFabId
+      );
+
+    if (!ownerId)
+      return [];
+
+    const cached =
+      privateConversationIndexCache.get(
+        ownerId
+      );
+
+    if (
+      cached &&
+      cached.expires >
+        nowMs() &&
+      Array.isArray(
+        cached.conversations
+      )
+    ) {
+      return cached.conversations;
+    }
+
+    const maxConversations =
+      Math.max(
+        1,
+        Math.min(
+          MAX_PRIVATE_INBOX_CONVERSATIONS,
+          Number(
+            requestedLimit
+          ) ||
+            MAX_PRIVATE_INBOX_CONVERSATIONS
+        )
+      );
+
+    let resources =
+      [];
+
+    try {
+      resources =
+        await listPrivateConversationIndexResources(
+          ownerId,
+          Math.min(
+            PRIVATE_CONVERSATION_INDEX_MAX_RESOURCES,
+            Math.max(
+              maxConversations,
+              500
+            )
+          )
+        );
+    } catch (error) {
+      console.warn(
+        "[LuxuryChat][PRIVATE_INDEX][LIST_FAILED]",
+        {
+          ownerId,
+
+          error:
+            error &&
+            error.message
+              ? sanitizeUnicodeString(
+                  error.message
+                )
+              : error,
+        }
+      );
+
+      return [];
+    }
+
+    const documents =
+      await mapPrivateIndexWithConcurrency(
+        resources,
+        async (resource) =>
+          readPrivateConversationIndexMarker(
+            resource
+          )
+      );
+
+    const cutoffUnixMs =
+      nowMs() -
+      PRIVATE_INBOX_ACTIVE_HOURS *
+        60 *
+        60 *
+        1000;
+
+    const byPeer =
+      new Map();
+
+    for (
+      const raw
+      of documents
+    ) {
+      if (
+        !raw ||
+        typeof raw !==
+          "object"
+      ) {
+        continue;
+      }
+
+      const rawOwner =
+        canonicalPrivatePlayerId(
+          raw.ownerId
+        );
+
+      const peerId =
+        canonicalPrivatePlayerId(
+          raw.peerId
+        );
+
+      const lastActivityUnixMs =
+        Math.max(
+          0,
+          Number(
+            raw.lastActivityUnixMs
+          ) || 0
+        );
+
+      if (
+        rawOwner !== ownerId ||
+        !peerId ||
+        peerId === ownerId ||
+        lastActivityUnixMs <
+          cutoffUnixMs
+      ) {
+        continue;
+      }
+
+      const item = {
+        peerId,
+
+        peerName:
+          safeString(
+            raw.peerName,
+            64
+          ) ||
+          "لاعب",
+
+        preview:
+          safeString(
+            raw.preview,
+            120
+          ),
+
+        kind:
+          safeString(
+            raw.kind,
+            30
+          ) ||
+          "text",
+
+        peerAvatarUrl:
+          safeString(
+            raw.peerAvatarUrl,
+            1000
+          ),
+
+        peerAvatarVersion:
+          safeString(
+            raw.peerAvatarVersion,
+            100
+          ) ||
+          "0",
+
+        lastActivityUnixMs,
+
+        lastInboxEventSeq:
+          0,
+
+        unreadCount:
+          Math.max(
+            0,
+            Number(
+              raw.unreadCount
+            ) || 0
+          ),
+
+        lastMessageMine:
+          !!raw.lastMessageMine,
+      };
+
+      const previous =
+        byPeer.get(
+          peerId
+        );
+
+      if (
+        !previous ||
+        item.lastActivityUnixMs >=
+          previous.lastActivityUnixMs
+      ) {
+        byPeer.set(
+          peerId,
+          item
+        );
+      }
+    }
+
+    const conversations =
+      Array.from(
+        byPeer.values()
+      )
+        .sort(
+          (a, b) =>
+            Number(
+              b.lastActivityUnixMs
+            ) -
+            Number(
+              a.lastActivityUnixMs
+            )
+        )
+        .slice(
+          0,
+          maxConversations
+        );
+
+    privateConversationIndexCache.set(
+      ownerId,
+      {
+        expires:
+          nowMs() +
+          PRIVATE_CONVERSATION_INDEX_CACHE_MS,
+
+        conversations,
+      }
+    );
+
+    return conversations;
+  }
+
+  async function backfillPrivateConversationIndex(
+    ownerPlayFabId,
+    conversations
+  ) {
+    const ownerId =
+      canonicalPrivatePlayerId(
+        ownerPlayFabId
+      );
+
+    const items =
+      Array.isArray(
+        conversations
+      )
+        ? conversations
+        : [];
+
+    if (
+      !ownerId ||
+      items.length === 0
+    ) {
+      return;
+    }
+
+    await mapPrivateIndexWithConcurrency(
+      items.slice(
+        0,
+        MAX_PRIVATE_INBOX_CONVERSATIONS
+      ),
+      async (item) => {
+        if (!item)
+          return null;
+
+        const peerId =
+          canonicalPrivatePlayerId(
+            item.peerId
+          );
+
+        if (
+          !peerId ||
+          peerId === ownerId
+        ) {
+          return null;
+        }
+
+        return enqueuePrivateConversationIndexMarker(
+          ownerId,
+          peerId,
+          {
+            playerName:
+              item.peerName,
+
+            avatarUrl:
+              item.peerAvatarUrl,
+
+            avatarVersion:
+              item.peerAvatarVersion,
+          },
+          item.kind,
+          item.preview,
+          item.lastActivityUnixMs,
+          item.lastMessageMine,
+          "",
+          item.unreadCount
+        );
+      }
+    );
+  }
+
   function stablePrivateInboxToken(
     value
   ) {
@@ -1948,6 +2787,71 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         preview,
       });
 
+    // V17: أولاً نكتب فهرساً دائماً مستقلاً للطرفين.
+    // هذا الفهرس هو الذي يعيد القائمة بعد إغلاق اللعبة وفتحها.
+    const indexResults =
+      await Promise.allSettled([
+        enqueuePrivateConversationIndexMarker(
+          senderId,
+          peerId,
+          peerProfile,
+          kind,
+          preview,
+          sentUnixMs,
+          true,
+          sourceMessage.id,
+          0
+        ),
+
+        enqueuePrivateConversationIndexMarker(
+          peerId,
+          senderId,
+          senderProfile,
+          kind,
+          preview,
+          sentUnixMs,
+          false,
+          sourceMessage.id,
+          1
+        ),
+      ]);
+
+    const senderIndexOk =
+      indexResults[0] &&
+      indexResults[0].status ===
+        "fulfilled";
+
+    const peerIndexOk =
+      indexResults[1] &&
+      indexResults[1].status ===
+        "fulfilled";
+
+    if (
+      !senderIndexOk ||
+      !peerIndexOk
+    ) {
+      console.warn(
+        "[LuxuryChat][PRIVATE_INDEX][PARTIAL_FAILURE]",
+        {
+          sourceMessageId:
+            safeString(
+              sourceMessage.id,
+              100
+            ),
+
+          senderId,
+          peerId,
+
+          senderIndex:
+            senderIndexOk,
+
+          peerIndex:
+            peerIndexOk,
+        }
+      );
+    }
+
+    // نبقي Inbox Events الحالية للـ unread/read والتوافق مع Unity.
     const results =
       await Promise.allSettled([
         pushPrivateInboxEventWithRetry(
@@ -2016,13 +2920,21 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     }
 
     return {
+      // يكفي نجاح المصدر الدائم أو Inbox القديم لكل طرف.
       mirrored:
-        senderOk &&
-        peerOk,
+        (
+          senderIndexOk ||
+          senderOk
+        ) &&
+        (
+          peerIndexOk ||
+          peerOk
+        ),
 
       senderOk,
-
       peerOk,
+      senderIndexOk,
+      peerIndexOk,
     };
   }
 
@@ -11776,6 +12688,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             req.body.maxConversations
           );
 
+        // V17: المصدر الدائم الأساسي لقائمة آخر 24 ساعة.
+        const indexed =
+          await loadPrivateConversationIndex(
+            playFabId,
+            snapshot.maxConversations
+          );
+
         let repairCompleted =
           !wantsRepair;
 
@@ -11803,11 +12722,51 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             )
               ? repair.conversations
               : [];
+
+          // أي محادثة قديمة استعدناها من تاريخ الخاص نثبتها في V17
+          // حتى لا نحتاج مسح تاريخ Cloudinary مرة أخرى في الدخول التالي.
+          if (
+            repairCompleted &&
+            recovered.length > 0
+          ) {
+            try {
+              await backfillPrivateConversationIndex(
+                playFabId,
+                recovered
+              );
+            } catch (error) {
+              console.warn(
+                "[LuxuryChat][PRIVATE_INDEX][BACKFILL_FAILED]",
+                {
+                  playFabId:
+
+                    canonicalPrivatePlayerId(
+                      playFabId
+                    ),
+
+                  error:
+                    error &&
+                    error.message
+                      ? sanitizeUnicodeString(
+                          error.message
+                        )
+                      : error,
+                }
+              );
+            }
+          }
         }
+
+        const snapshotPlusIndex =
+          mergePrivateInboxConversationLists(
+            snapshot.conversations,
+            indexed,
+            snapshot.maxConversations
+          );
 
         const conversations =
           mergePrivateInboxConversationLists(
-            snapshot.conversations,
+            snapshotPlusIndex,
             recovered,
             snapshot.maxConversations
           );
@@ -11836,10 +12795,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             recoveredFromPrivateHistory:
               recovered.length,
 
+            indexedFromPersistentPairMarkers:
+              indexed.length,
+
             source:
               wantsRepair
-                ? "private-inbox-24h-self-heal-v16"
-                : "private-inbox-24h-index-v16",
+                ? "private-inbox-24h-persistent-pair-index-v17-repair"
+                : "private-inbox-24h-persistent-pair-index-v17",
 
             build:
               SERVER_BUILD,
@@ -13910,6 +14872,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         true,
 
       privateInboxSelfHealFromRealHistory:
+        true,
+
+      privateInboxPersistentPairIndexV17:
         true,
 
       privateInboxMaxConversations:
