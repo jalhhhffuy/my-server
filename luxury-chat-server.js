@@ -1,7 +1,7 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V17 PRIVATE 24H PERSISTENT INDEX / UNITY UTF16 SAFE
+// Luxury Chat Server - V18 PRIVATE 24H PERSISTENT INDEX / AUTH TRACE / UNITY UTF16 SAFE
 // SERVER-AUTHORITATIVE PRIVATE INBOX + 24H CONVERSATION DELIVERY
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
@@ -9,7 +9,7 @@
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // BUILD:
-// 2026-08-11-LUXURY-CHAT-SERVER-V17-PRIVATE-24H-PERSISTENT-PAIR-INDEX
+// 2026-08-11-LUXURY-CHAT-SERVER-V18-PRIVATE-24H-AUTH-TRACE-PAIR-INDEX
 //
 // server.js:
 // const installLuxuryChat = require("./luxury-chat-server");
@@ -92,7 +92,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-11-LUXURY-CHAT-SERVER-V17-PRIVATE-24H-PERSISTENT-PAIR-INDEX";
+    "2026-08-11-LUXURY-CHAT-SERVER-V18-PRIVATE-24H-AUTH-TRACE-PAIR-INDEX";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -12771,6 +12771,19 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             snapshot.maxConversations
           );
 
+        console.log(
+          "[LuxuryChat][PRIVATE_INBOX][SNAPSHOT]",
+          {
+            ownerId: canonicalPrivatePlayerId(playFabId),
+            count: conversations.length,
+            fromInboxEvents: snapshot.conversations.length,
+            fromPersistentIndex: indexed.length,
+            recoveredFromHistory: recovered.length,
+            repairCompleted,
+            build: SERVER_BUILD,
+          }
+        );
+
         return res.json(
           sanitizeJsonForUnity({
             ok:
@@ -13049,10 +13062,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           if (duplicate) {
             // إذا كانت الرسالة الأصلية موجودة لكن Inbox فشل سابقاً،
             // Retry لن يكرر الرسالة؛ فقط يعيد ضمان Inbox للطرفين.
-            await ensurePrivateInboxForMessageSafe(
-              roomId,
-              duplicate
-            );
+            const privateInboxMirror =
+              await ensurePrivateInboxForMessageSafe(
+                roomId,
+                duplicate
+              );
 
             return res.json({
               ok:
@@ -13064,6 +13078,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
               message:
                 sanitizeJsonForUnity(
                   duplicate
+                ),
+
+              privateInboxMirror:
+                sanitizeJsonForUnity(
+                  privateInboxMirror
                 ),
             });
           }
@@ -13127,10 +13146,24 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           );
 
         // المصدر الرسمي لقائمة الخاص الآن هو السيرفر نفسه.
-        await ensurePrivateInboxForMessageSafe(
-          roomId,
-          message
-        );
+        const privateInboxMirror =
+          await ensurePrivateInboxForMessageSafe(
+            roomId,
+            message
+          );
+
+        if (isPrivateConversationRoom(roomId)) {
+          console.log(
+            "[LuxuryChat][PRIVATE_INBOX][SEND_RESULT]",
+            {
+              room: roomId,
+              senderId: canonicalPrivatePlayerId(playFabId),
+              messageId: safeString(message && message.id, 100),
+              mirror: privateInboxMirror,
+              build: SERVER_BUILD,
+            }
+          );
+        }
 
         return res.json({
           ok:
@@ -13139,6 +13172,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           message:
             sanitizeJsonForUnity(
               message
+            ),
+
+          privateInboxMirror:
+            sanitizeJsonForUnity(
+              privateInboxMirror
             ),
         });
       } catch (error) {
@@ -14818,7 +14856,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     "[LuxuryChat] installed",
     {
       version:
-        16,
+        18,
 
       build:
         SERVER_BUILD,
