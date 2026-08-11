@@ -2,13 +2,14 @@
 
 // ============================================================================
 // Luxury Chat Server - V13 UNITY UTF16 / SURROGATE HISTORY SAFE
+// SERVER-AUTHORITATIVE PRIVATE INBOX + 24H CONVERSATION DELIVERY
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
 // IMAGE + VIDEO MODERATION: Amazon Rekognition via Cloudinary
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // BUILD:
-// 2026-08-10-LUXURY-CHAT-SERVER-V13-UNITY-UTF16-SURROGATE-HISTORY-SAFE
+// 2026-08-11-LUXURY-CHAT-SERVER-V13-UNITY-UTF16-PRIVATE-INBOX-SERVER-AUTH
 //
 // server.js:
 // const installLuxuryChat = require("./luxury-chat-server");
@@ -44,6 +45,16 @@
 // - تاريخ Cloudinary القديم الذي يحتوي String تالف يمكن قراءته ثم تنظيفه قبل Unity.
 // - لا نحذف الرسالة كاملة بسبب حرف UTF-16 تالف؛ نحذف فقط الوحدة التالفة.
 // - نفس نظام V12 بالكامل بدون إزالة أنظمة الشات.
+//
+// إصلاح الخاص الحالي:
+// - السيرفر نفسه أصبح يكتب Inbox للطرفين فور نجاح أي رسالة خاصة.
+// - المستقبل يرى المحادثة في تبويب "خاص" وهو ما زال في العام، بدون فتح الغرفة أولاً.
+// - كل رسالة خاصة واردة = Inbox Event مستقل، لذلك unreadCount يحسب عدد الرسائل فعلياً.
+// - يدعم النص + الصوت + الصورة + الفيديو بعد اعتماد الفيديو.
+// - يستخدم نفس __LPI1__ وصيغة clientMessageId الحالية في Unity لمنع التكرار.
+// - عند Retry لن تتكرر المحادثة أو الرسالة في Inbox.
+// - جلب inbox_ يجلب صور اللاعبين تلقائياً حتى لو Unity لم يطلب refreshProfiles.
+// - في حدث "رسالتي" يعيد السيرفر Profile الطرف الآخر حتى تظهر صورته في قائمة المحادثات.
 // ============================================================================
 
 const multer = require("multer");
@@ -59,7 +70,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-10-LUXURY-CHAT-SERVER-V13-UNITY-UTF16-SURROGATE-HISTORY-SAFE";
+    "2026-08-11-LUXURY-CHAT-SERVER-V13-UNITY-UTF16-PRIVATE-INBOX-SERVER-AUTH";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -73,6 +84,17 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   const MAX_REACTION_FETCH_LIMIT = 600;
 
   const REACTION_REMOVE_TOKEN = "__LUXURY_CHAT_REACTION_REMOVE__";
+
+  // نفس Tokens الموجودة في LuxuryPrivateChatManager الحالي.
+  const PRIVATE_INBOX_EVENT_TOKEN = "__LPI1__";
+  const PRIVATE_INBOX_READ_TOKEN = "__LPIR1__";
+
+  const PRIVATE_INBOX_MIRROR_RETRY_DELAYS_MS = [
+    0,
+    140,
+    420,
+    900,
+  ];
 
   const QUICK_REACTIONS = new Set([
     "👍",
@@ -765,6 +787,887 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       return "video";
 
     return "text";
+  }
+
+
+  // ========================================================================
+  // PRIVATE INBOX - SERVER AUTHORITATIVE
+  // ========================================================================
+
+  function canonicalPrivatePlayerId(
+    value
+  ) {
+    const raw =
+      safeString(
+        value,
+        100
+      )
+        .trim()
+        .toLowerCase();
+
+    if (!raw)
+      return "";
+
+    const chars =
+      raw
+        .replace(
+          /[^a-z0-9_-]+/g,
+          "_"
+        )
+        .replace(
+          /^_+|_+$/g,
+          ""
+        );
+
+    return /^[a-z0-9_-]{1,40}$/.test(
+      chars
+    )
+      ? chars
+      : "";
+  }
+
+  function isPrivateConversationRoom(
+    roomId
+  ) {
+    const room =
+      cleanRoom(
+        roomId
+      );
+
+    return (
+      room.startsWith(
+        "private_"
+      ) ||
+      room.startsWith(
+        "p_"
+      )
+    );
+  }
+
+  function isPrivateInboxRoom(
+    roomId
+  ) {
+    const room =
+      cleanRoom(
+        roomId
+      );
+
+    return (
+      room.startsWith(
+        "inbox_"
+      ) ||
+      room.startsWith(
+        "i_"
+      )
+    );
+  }
+
+  function privateRoomPayload(
+    roomId
+  ) {
+    const room =
+      cleanRoom(
+        roomId
+      );
+
+    if (
+      room.startsWith(
+        "private_"
+      )
+    ) {
+      return room.slice(
+        "private_".length
+      );
+    }
+
+    if (
+      room.startsWith(
+        "p_"
+      )
+    ) {
+      return room.slice(2);
+    }
+
+    return "";
+  }
+
+  function privatePeerFromRoom(
+    roomId,
+    senderPlayFabId
+  ) {
+    if (
+      !isPrivateConversationRoom(
+        roomId
+      )
+    ) {
+      return "";
+    }
+
+    const mine =
+      canonicalPrivatePlayerId(
+        senderPlayFabId
+      );
+
+    const payload =
+      privateRoomPayload(
+        roomId
+      );
+
+    if (
+      !mine ||
+      !payload
+    ) {
+      return "";
+    }
+
+    const mineAtStart =
+      `${mine}_`;
+
+    if (
+      payload.startsWith(
+        mineAtStart
+      )
+    ) {
+      return canonicalPrivatePlayerId(
+        payload.slice(
+          mineAtStart.length
+        )
+      );
+    }
+
+    const mineAtEnd =
+      `_${mine}`;
+
+    if (
+      payload.endsWith(
+        mineAtEnd
+      )
+    ) {
+      return canonicalPrivatePlayerId(
+        payload.slice(
+          0,
+          payload.length -
+            mineAtEnd.length
+        )
+      );
+    }
+
+    return "";
+  }
+
+  function buildPrivateInboxRoomId(
+    playFabId
+  ) {
+    const part =
+      canonicalPrivatePlayerId(
+        playFabId
+      );
+
+    if (!part)
+      return "";
+
+    const normal =
+      `inbox_${part}`;
+
+    if (
+      /^[a-z0-9_-]{1,40}$/.test(
+        normal
+      )
+    ) {
+      return normal;
+    }
+
+    const keep =
+      Math.min(
+        37,
+        part.length
+      );
+
+    const shortId =
+      `i_${part.slice(
+        part.length - keep
+      )}`;
+
+    return /^[a-z0-9_-]{1,40}$/.test(
+      shortId
+    )
+      ? shortId
+      : "";
+  }
+
+  function cleanPrivateInboxField(
+    value,
+    maximumGraphemes
+  ) {
+    const clean =
+      sanitizeUnicodeString(
+        value
+      )
+        .replace(
+          /\r\n/g,
+          " "
+        )
+        .replace(
+          /[\r\n]/g,
+          " "
+        )
+        .replace(
+          /\|/g,
+          "¦"
+        )
+        .trim();
+
+    return truncateUnicode(
+      clean,
+      maximumGraphemes
+    );
+  }
+
+  function privateInboxKind(
+    message
+  ) {
+    if (!message)
+      return "text";
+
+    const kind =
+      normalizeKind(
+        message.kind ||
+        message.mediaType
+      );
+
+    if (
+      kind === "voice" ||
+      kind === "image" ||
+      kind === "video"
+    ) {
+      return kind;
+    }
+
+    return "text";
+  }
+
+  function privateInboxPreview(
+    message
+  ) {
+    const kind =
+      privateInboxKind(
+        message
+      );
+
+    if (kind === "voice")
+      return "ملاحظة صوتية";
+
+    if (kind === "image")
+      return "صورة";
+
+    if (kind === "video")
+      return "فيديو";
+
+    const text =
+      cleanPrivateInboxField(
+        message &&
+        message.text,
+        54
+      );
+
+    return text ||
+      "رسالة خاصة";
+  }
+
+  function buildPrivateInboxEventText({
+    mineEvent,
+    peerId,
+    peerName,
+    kind,
+    preview,
+  }) {
+    return [
+      PRIVATE_INBOX_EVENT_TOKEN,
+      mineEvent ? "1" : "0",
+      canonicalPrivatePlayerId(
+        peerId
+      ),
+      cleanPrivateInboxField(
+        peerName || "لاعب",
+        32
+      ) || "لاعب",
+      cleanPrivateInboxField(
+        kind || "text",
+        12
+      ) || "text",
+      cleanPrivateInboxField(
+        preview || "رسالة خاصة",
+        72
+      ),
+    ].join("|");
+  }
+
+  function parsePrivateInboxEventText(
+    value
+  ) {
+    const text =
+      sanitizeUnicodeString(
+        value
+      );
+
+    if (
+      !text.startsWith(
+        `${PRIVATE_INBOX_EVENT_TOKEN}|`
+      )
+    ) {
+      return null;
+    }
+
+    const parts =
+      text.split(
+        "|"
+      );
+
+    if (
+      parts.length <
+      6
+    ) {
+      return null;
+    }
+
+    const peerId =
+      canonicalPrivatePlayerId(
+        parts[2]
+      );
+
+    if (!peerId)
+      return null;
+
+    return {
+      mineEvent:
+        parts[1] === "1",
+
+      peerId,
+
+      peerName:
+        safeString(
+          parts[3],
+          64
+        ),
+
+      kind:
+        safeString(
+          parts[4],
+          30
+        ),
+
+      preview:
+        safeString(
+          parts
+            .slice(5)
+            .join("|"),
+          120
+        ),
+    };
+  }
+
+  function stablePrivateInboxToken(
+    value
+  ) {
+    // مطابق تماماً لـ StableShortToken في LuxuryPrivateChatManager:
+    // ulong + UTF-16 char + overflow 64-bit + x16.
+    let hash =
+      1469598103934665603n;
+
+    const prime =
+      1099511628211n;
+
+    const text =
+      String(
+        value || ""
+      );
+
+    for (
+      let i = 0;
+      i < text.length;
+      i++
+    ) {
+      hash ^=
+        BigInt(
+          text.charCodeAt(i)
+        );
+
+      hash =
+        BigInt.asUintN(
+          64,
+          hash * prime
+        );
+    }
+
+    return hash
+      .toString(16)
+      .padStart(
+        16,
+        "0"
+      );
+  }
+
+  function privateInboxSourceProfile(
+    message
+  ) {
+    return {
+      playerName:
+        safeString(
+          message &&
+          message.senderName,
+          32
+        ) ||
+        "لاعب",
+
+      avatarUrl:
+        safeString(
+          message &&
+          message.senderAvatarUrl,
+          1000
+        ),
+
+      avatarVersion:
+        safeString(
+          message &&
+          message.senderAvatarVersion,
+          100
+        ) ||
+        "0",
+    };
+  }
+
+  async function pushPrivateInboxEventWithRetry(
+    inboxRoom,
+    eventMessage
+  ) {
+    if (
+      !inboxRoom ||
+      !eventMessage
+    ) {
+      return null;
+    }
+
+    let lastError =
+      null;
+
+    for (
+      let attempt = 0;
+      attempt <
+        PRIVATE_INBOX_MIRROR_RETRY_DELAYS_MS.length;
+      attempt++
+    ) {
+      const delay =
+        PRIVATE_INBOX_MIRROR_RETRY_DELAYS_MS[
+          attempt
+        ];
+
+      if (delay > 0) {
+        await sleep(
+          delay
+        );
+      }
+
+      try {
+        return await pushMessage(
+          inboxRoom,
+          eventMessage
+        );
+      } catch (error) {
+        lastError =
+          error;
+
+        console.warn(
+          "[LuxuryChat][PRIVATE_INBOX][WRITE_RETRY]",
+          {
+            room:
+              inboxRoom,
+
+            attempt:
+              attempt + 1,
+
+            error:
+              error &&
+              error.message
+                ? sanitizeUnicodeString(
+                    error.message
+                  )
+                : error,
+          }
+        );
+      }
+    }
+
+    throw (
+      lastError ||
+      new Error(
+        "private_inbox_write_failed"
+      )
+    );
+  }
+
+  async function ensurePrivateInboxForMessage(
+    roomId,
+    sourceMessage
+  ) {
+    if (
+      !sourceMessage ||
+      !sourceMessage.id ||
+      !isPrivateConversationRoom(
+        roomId
+      )
+    ) {
+      return {
+        mirrored:
+          false,
+
+        reason:
+          "not_private_message",
+      };
+    }
+
+    const senderId =
+      canonicalPrivatePlayerId(
+        sourceMessage.senderId
+      );
+
+    const peerId =
+      privatePeerFromRoom(
+        roomId,
+        senderId
+      );
+
+    if (
+      !senderId ||
+      !peerId ||
+      senderId === peerId
+    ) {
+      console.warn(
+        "[LuxuryChat][PRIVATE_INBOX][PEER_RESOLVE_FAILED]",
+        {
+          room:
+            cleanRoom(
+              roomId
+            ),
+
+          senderId:
+            senderId ||
+            safeString(
+              sourceMessage.senderId,
+              100
+            ),
+        }
+      );
+
+      return {
+        mirrored:
+          false,
+
+        reason:
+          "peer_resolve_failed",
+      };
+    }
+
+    const senderInboxRoom =
+      buildPrivateInboxRoomId(
+        senderId
+      );
+
+    const peerInboxRoom =
+      buildPrivateInboxRoomId(
+        peerId
+      );
+
+    if (
+      !senderInboxRoom ||
+      !peerInboxRoom
+    ) {
+      return {
+        mirrored:
+          false,
+
+        reason:
+          "inbox_room_invalid",
+      };
+    }
+
+    const senderProfile =
+      privateInboxSourceProfile(
+        sourceMessage
+      );
+
+    let peerProfile = {
+      playerName:
+        "لاعب",
+
+      avatarUrl:
+        "",
+
+      avatarVersion:
+        "0",
+    };
+
+    try {
+      peerProfile =
+        await getPlayerProfile(
+          peerId,
+          false
+        );
+    } catch (_) {}
+
+    const kind =
+      privateInboxKind(
+        sourceMessage
+      );
+
+    const preview =
+      privateInboxPreview(
+        sourceMessage
+      );
+
+    const stable =
+      stablePrivateInboxToken(
+        sourceMessage.id
+      );
+
+    const sentUnixMs =
+      Math.max(
+        1,
+        Number(
+          sourceMessage.sentUnixMs
+        ) ||
+        nowMs()
+      );
+
+    const senderEvent =
+      makeMessage({
+        roomId:
+          senderInboxRoom,
+
+        senderId:
+          sourceMessage.senderId,
+
+        profile:
+          senderProfile,
+
+        kind:
+          "text",
+
+        reply:
+          null,
+
+        clientMessageId:
+          `lpim_me_${stable}`,
+      });
+
+    senderEvent.sentUnixMs =
+      sentUnixMs;
+
+    senderEvent.text =
+      buildPrivateInboxEventText({
+        mineEvent:
+          true,
+
+        peerId,
+
+        peerName:
+          peerProfile &&
+          peerProfile.playerName,
+
+        kind,
+
+        preview,
+      });
+
+    const peerEvent =
+      makeMessage({
+        roomId:
+          peerInboxRoom,
+
+        senderId:
+          sourceMessage.senderId,
+
+        profile:
+          senderProfile,
+
+        kind:
+          "text",
+
+        reply:
+          null,
+
+        clientMessageId:
+          `lpim_peer_${stable}`,
+      });
+
+    peerEvent.sentUnixMs =
+      sentUnixMs;
+
+    peerEvent.text =
+      buildPrivateInboxEventText({
+        mineEvent:
+          false,
+
+        peerId:
+          senderId,
+
+        peerName:
+          senderProfile.playerName,
+
+        kind,
+
+        preview,
+      });
+
+    const results =
+      await Promise.allSettled([
+        pushPrivateInboxEventWithRetry(
+          senderInboxRoom,
+          senderEvent
+        ),
+
+        pushPrivateInboxEventWithRetry(
+          peerInboxRoom,
+          peerEvent
+        ),
+      ]);
+
+    const senderOk =
+      results[0] &&
+      results[0].status ===
+        "fulfilled";
+
+    const peerOk =
+      results[1] &&
+      results[1].status ===
+        "fulfilled";
+
+    if (
+      !senderOk ||
+      !peerOk
+    ) {
+      console.warn(
+        "[LuxuryChat][PRIVATE_INBOX][PARTIAL_FAILURE]",
+        {
+          sourceMessageId:
+            safeString(
+              sourceMessage.id,
+              100
+            ),
+
+          room:
+            cleanRoom(
+              roomId
+            ),
+
+          senderInbox:
+            senderOk,
+
+          peerInbox:
+            peerOk,
+        }
+      );
+    } else {
+      console.log(
+        "[LuxuryChat][PRIVATE_INBOX][MIRRORED]",
+        {
+          sourceMessageId:
+            safeString(
+              sourceMessage.id,
+              100
+            ),
+
+          senderId,
+
+          peerId,
+
+          kind,
+        }
+      );
+    }
+
+    return {
+      mirrored:
+        senderOk &&
+        peerOk,
+
+      senderOk,
+
+      peerOk,
+    };
+  }
+
+  async function ensurePrivateInboxForMessageSafe(
+    roomId,
+    sourceMessage
+  ) {
+    try {
+      return await ensurePrivateInboxForMessage(
+        roomId,
+        sourceMessage
+      );
+    } catch (error) {
+      console.warn(
+        "[LuxuryChat][PRIVATE_INBOX][MIRROR_FAILED]",
+        {
+          room:
+            cleanRoom(
+              roomId
+            ),
+
+          messageId:
+            sourceMessage &&
+            sourceMessage.id
+              ? safeString(
+                  sourceMessage.id,
+                  100
+                )
+              : "",
+
+          error:
+            error &&
+            error.message
+              ? sanitizeUnicodeString(
+                  error.message
+                )
+              : error,
+        }
+      );
+
+      return {
+        mirrored:
+          false,
+
+        reason:
+          "mirror_failed",
+      };
+    }
+  }
+
+  function profileLookupIdForResponseMessage(
+    message
+  ) {
+    if (!message)
+      return "";
+
+    const parsed =
+      parsePrivateInboxEventText(
+        message.text
+      );
+
+    if (
+      parsed &&
+      parsed.mineEvent &&
+      parsed.peerId
+    ) {
+      // حدث "رسالتي" داخل inbox الخاص بي:
+      // للعرض نريد صورة الطرف الآخر وليس صورتي أنا.
+      return parsed.peerId;
+    }
+
+    return safeString(
+      message.senderId,
+      100
+    );
   }
 
   function pruneRateMap(
@@ -7737,11 +8640,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         new Set(
           result
             .map(
-              (m) =>
-                safeString(
-                  m &&
-                  m.senderId,
-                  100
+              (message) =>
+                profileLookupIdForResponseMessage(
+                  message
                 )
             )
             .filter(
@@ -7778,20 +8679,40 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       const message
       of result
     ) {
-      if (
-        !message ||
-        !message.senderId
-      ) {
+      if (!message)
         continue;
-      }
+
+      const profileId =
+        profileLookupIdForResponseMessage(
+          message
+        );
+
+      if (!profileId)
+        continue;
 
       const profile =
         profiles.get(
-          message.senderId
+          profileId
         );
 
       if (!profile)
         continue;
+
+      // للـInbox mineEvent فقط نعيد senderId للطرف الآخر في Response.
+      // التخزين نفسه يبقى senderId الأصلي حتى يتطابق Dedup مع Unity.
+      const parsedInboxEvent =
+        parsePrivateInboxEventText(
+          message.text
+        );
+
+      if (
+        parsedInboxEvent &&
+        parsedInboxEvent.mineEvent &&
+        parsedInboxEvent.peerId
+      ) {
+        message.senderId =
+          parsedInboxEvent.peerId;
+      }
 
       message.senderName =
         safeString(
@@ -7954,6 +8875,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           "video"
         );
       }
+    }
+
+    if (message) {
+      await ensurePrivateInboxForMessageSafe(
+        job.roomId,
+        message
+      );
     }
 
     job.status =
@@ -9263,7 +10191,10 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         const hydratedMessages =
           await hydrateProfilesForResponse(
             window.messages,
-            refreshProfiles
+            refreshProfiles ||
+              isPrivateInboxRoom(
+                roomId
+              )
           );
 
         const responseMessages =
@@ -9308,7 +10239,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             RETENTION_DAYS,
 
           source:
-            "cloudinary-sharded-v13-unity-utf16-safe-window",
+            "cloudinary-sharded-v13-unity-utf16-safe-private-inbox",
 
           build:
             SERVER_BUILD,
@@ -9397,6 +10328,13 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             );
 
           if (duplicate) {
+            // إذا كانت الرسالة الأصلية موجودة لكن Inbox فشل سابقاً،
+            // Retry لن يكرر الرسالة؛ فقط يعيد ضمان Inbox للطرفين.
+            await ensurePrivateInboxForMessageSafe(
+              roomId,
+              duplicate
+            );
+
             return res.json({
               ok:
                 true,
@@ -9468,6 +10406,12 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             roomId,
             message
           );
+
+        // المصدر الرسمي لقائمة الخاص الآن هو السيرفر نفسه.
+        await ensurePrivateInboxForMessageSafe(
+          roomId,
+          message
+        );
 
         return res.json({
           ok:
@@ -9570,6 +10514,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             );
 
           if (duplicate) {
+            await ensurePrivateInboxForMessageSafe(
+              roomId,
+              duplicate
+            );
+
             return res.json({
               ok:
                 true,
@@ -9667,6 +10616,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             roomId,
             attemptedMessage
           );
+
+        await ensurePrivateInboxForMessageSafe(
+          roomId,
+          message
+        );
 
         if (
           uploaded.publicId &&
@@ -10160,6 +11114,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             );
 
           if (duplicate) {
+            await ensurePrivateInboxForMessageSafe(
+              roomId,
+              duplicate
+            );
+
             return res.json({
               ok:
                 true,
@@ -10796,6 +11755,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             attemptedMessage
           );
 
+        await ensurePrivateInboxForMessageSafe(
+          roomId,
+          message
+        );
+
         if (
           uploadedImage.publicId &&
           message &&
@@ -11224,4 +12188,3 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     }
   );
 };
-
