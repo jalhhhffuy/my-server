@@ -97,7 +97,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-11-LUXURY-CHAT-SERVER-V19-PRIVATE-PRESENCE-READ-ZERO-SORT";
+    "2026-08-13-LUXURY-CHAT-SERVER-V21-INCREMENTAL-SERVER-RELATIONSHIPS";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -196,6 +196,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   const VIDEO_FOLDER = "chat_media_videos";
 
   const HISTORY_CACHE_SYNC_MS = 1500;
+
+  const PRIVATE_RELATIONSHIP_STATE_KEY =
+    "LUXURY_CHAT_PRIVATE_RELATIONSHIPS_V1";
 
   const HISTORY_SHARD_DISCOVERY_MS = Math.max(
     5000,
@@ -12606,149 +12609,79 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
   function buildHistoryResponseWindow(
     room,
-    limit
+    limit,
+    afterSeq = 0
   ) {
-    const normalMessages = [];
-    const reactionMessages = [];
+    const all = [];
 
-    for (
-      const message
-      of room.messages ||
-      []
-    ) {
-      if (!message)
-        continue;
+    for (const message of room.messages || []) {
+      if (!message) continue;
 
-      const normalized =
-        normalizeMessage(
-          message,
-          room.id
-        );
-
-      if (!normalized)
-        continue;
-
-      if (
-        isReactionMessageServer(
-          normalized
-        )
-      ) {
-        reactionMessages.push(
-          normalized
-        );
-      } else {
-        normalMessages.push(
-          normalized
-        );
-      }
+      const normalized = normalizeMessage(message, room.id);
+      if (!normalized) continue;
+      all.push(normalized);
     }
 
-    normalMessages.sort(
-      compareMessages
-    );
+    all.sort(compareMessages);
 
-    reactionMessages.sort(
-      compareMessages
-    );
-
-    const normalWindow =
-      normalMessages.slice(
-        Math.max(
-          0,
-          normalMessages.length -
-            limit
-        )
+    // Incremental: لا نعيد آخر 100 رسالة مع كل Poll.
+    // نعيد فقط الأحداث بعد الـcursor، بما فيها reaction events.
+    if (afterSeq > 0) {
+      const newer = all.filter(
+        (m) => Math.max(0, Number(m && m.seq) || 0) > afterSeq
       );
 
-    const visibleIds =
-      new Set(
-        normalWindow
-          .map(
-            (m) =>
-              safeString(
-                m &&
-                m.id,
-                100
-              )
+      const page = newer.slice(0, Math.max(1, limit));
+      const cursorSeq = page.length > 0
+        ? Math.max(
+            afterSeq,
+            ...page.map((m) => Math.max(0, Number(m && m.seq) || 0))
           )
-          .filter(
-            Boolean
-          )
-      );
+        : Math.max(afterSeq, Math.max(0, Number(room.seq) || 0));
 
-    const latestReactionByOwner =
-      new Map();
-
-    for (
-      const reaction
-      of reactionMessages
-    ) {
-      if (
-        !reaction ||
-        !visibleIds.has(
-          reaction.replyToId
-        )
-      ) {
-        continue;
-      }
-
-      const key =
-        `${reaction.replyToId}|${safeString(
-          reaction.senderId,
-          100
-        )}`;
-
-      const previous =
-        latestReactionByOwner.get(
-          key
-        );
-
-      if (
-        !previous ||
-        compareMessages(
-          previous,
-          reaction
-        ) < 0
-      ) {
-        latestReactionByOwner.set(
-          key,
-          reaction
-        );
-      }
+      return {
+        messages: sanitizeJsonForUnity(page),
+        hasMore: newer.length > page.length,
+        cursorSeq,
+      };
     }
 
-    const reactionStates =
-      Array.from(
-        latestReactionByOwner.values()
-      )
-        .sort(
-          compareMessages
-        )
-        .slice(
-          -MAX_REACTION_FETCH_LIMIT
-        );
+    // Full snapshot: آخر N رسائل فعلية + أحدث reaction state للرسائل الظاهرة.
+    const normalMessages = all.filter((m) => !isReactionMessageServer(m));
+    const reactionMessages = all.filter((m) => isReactionMessageServer(m));
+
+    const normalWindow = normalMessages.slice(
+      Math.max(0, normalMessages.length - limit)
+    );
+
+    const visibleIds = new Set(
+      normalWindow
+        .map((m) => safeString(m && m.id, 100))
+        .filter(Boolean)
+    );
+
+    const latestReactionByOwner = new Map();
+
+    for (const reaction of reactionMessages) {
+      if (!reaction || !visibleIds.has(reaction.replyToId)) continue;
+
+      const key = `${reaction.replyToId}|${safeString(reaction.senderId, 100)}`;
+      const previous = latestReactionByOwner.get(key);
+
+      if (!previous || compareMessages(previous, reaction) < 0)
+        latestReactionByOwner.set(key, reaction);
+    }
+
+    const reactionStates = Array.from(latestReactionByOwner.values())
+      .sort(compareMessages)
+      .slice(-MAX_REACTION_FETCH_LIMIT);
 
     return {
-      messages:
-        sanitizeJsonForUnity(
-          normalWindow
-            .concat(
-              reactionStates
-            )
-            .sort(
-              compareMessages
-            )
-        ),
-
-      hasMore:
-        normalMessages.length >
-        limit,
-
-      normalCount:
-        normalWindow.length,
-
-      reactionCount:
-        reactionStates.length,
+      messages: sanitizeJsonForUnity(
+        normalWindow.concat(reactionStates).sort(compareMessages)
+      ),
+      hasMore: normalMessages.length > limit,
+      cursorSeq: Math.max(0, Number(room.seq) || 0),
     };
   }
 
@@ -13239,6 +13172,251 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   );
 
   // ========================================================================
+  // PRIVATE RELATIONSHIP STATE - SERVER AUTHORITATIVE
+  // ========================================================================
+
+  function normalizePrivateRelationshipState(raw) {
+    const state = {
+      version: 1,
+      updatedUnixMs: Math.max(0, Number(raw && raw.updatedUnixMs) || 0),
+      relations: {},
+    };
+
+    const source =
+      raw && raw.relations && typeof raw.relations === "object"
+        ? raw.relations
+        : {};
+
+    let count = 0;
+    for (const [rawPeer, rawItem] of Object.entries(source)) {
+      if (count >= 2000) break;
+
+      const peerId = canonicalPrivatePlayerId(rawPeer);
+      if (!peerId || !rawItem || typeof rawItem !== "object") continue;
+
+      const item = {
+        blockedByMeUnixMs: Math.max(0, Number(rawItem.blockedByMeUnixMs) || 0),
+        blockedMeUnixMs: Math.max(0, Number(rawItem.blockedMeUnixMs) || 0),
+        deletedCutoffUnixMs: Math.max(0, Number(rawItem.deletedCutoffUnixMs) || 0),
+      };
+
+      if (item.blockedByMeUnixMs > 0 ||
+          item.blockedMeUnixMs > 0 ||
+          item.deletedCutoffUnixMs > 0) {
+        state.relations[peerId] = item;
+        count++;
+      }
+    }
+
+    return state;
+  }
+
+  async function readPrivateRelationshipState(playFabId) {
+    const data = await playFabServerCall(
+      "GetUserData",
+      {
+        PlayFabId: playFabId,
+        Keys: [PRIVATE_RELATIONSHIP_STATE_KEY],
+      }
+    );
+
+    const record =
+      data && data.Data
+        ? data.Data[PRIVATE_RELATIONSHIP_STATE_KEY]
+        : null;
+
+    if (!record || !record.Value)
+      return normalizePrivateRelationshipState(null);
+
+    let parsed = null;
+    try {
+      parsed = JSON.parse(String(record.Value));
+    } catch (_) {
+      parsed = null;
+    }
+
+    return normalizePrivateRelationshipState(parsed);
+  }
+
+  async function savePrivateRelationshipState(playFabId, state) {
+    const normalized = normalizePrivateRelationshipState(state);
+    normalized.updatedUnixMs = nowMs();
+
+    await playFabServerCall(
+      "UpdateUserData",
+      {
+        PlayFabId: playFabId,
+        Data: {
+          [PRIVATE_RELATIONSHIP_STATE_KEY]: safeJsonStringify(normalized),
+        },
+        Permission: "Private",
+      }
+    );
+
+    return normalized;
+  }
+
+  function privateRelationshipStateResponse(state) {
+    const items = [];
+
+    for (const [peerId, relation] of Object.entries(
+      state && state.relations ? state.relations : {}
+    )) {
+      items.push({
+        peerId,
+        blockedByMeUnixMs: Math.max(0, Number(relation.blockedByMeUnixMs) || 0),
+        blockedMeUnixMs: Math.max(0, Number(relation.blockedMeUnixMs) || 0),
+        deletedCutoffUnixMs: Math.max(0, Number(relation.deletedCutoffUnixMs) || 0),
+      });
+    }
+
+    return sanitizeJsonForUnity({
+      ok: true,
+      items,
+      serverNowUnixMs: nowMs(),
+      build: SERVER_BUILD,
+    });
+  }
+
+  app.post(
+    "/chat/private-state",
+    async (req, res) => {
+      try {
+        const playFabId = await authenticateSessionTicket(
+          req.body && req.body.sessionTicket
+        );
+
+        touchPrivatePresence(playFabId);
+        const state = await readPrivateRelationshipState(playFabId);
+        return res.json(privateRelationshipStateResponse(state));
+      } catch (error) {
+        console.error("/chat/private-state", error);
+        return res.status(500).json({
+          ok: false,
+          error: "تعذر تحميل حالة الخاص",
+          build: SERVER_BUILD,
+        });
+      }
+    }
+  );
+
+  app.post(
+    "/chat/private-state/update",
+    async (req, res) => {
+      try {
+        const playFabId = await authenticateSessionTicket(
+          req.body && req.body.sessionTicket
+        );
+
+        touchPrivatePresence(playFabId);
+
+        const owner = canonicalPrivatePlayerId(playFabId);
+        const peerId = canonicalPrivatePlayerId(req.body && req.body.peerId);
+        const action = safeString(req.body && req.body.action, 40).toLowerCase();
+        const value = Math.max(0, Number(req.body && req.body.value) || 0);
+
+        if (!peerId || peerId === owner) {
+          return res.status(400).json({
+            ok: false,
+            error: "معرف اللاعب غير صالح",
+            build: SERVER_BUILD,
+          });
+        }
+
+        const allowed = new Set([
+          "block",
+          "unblock",
+          "blocked_me",
+          "unblocked_me",
+          "delete",
+        ]);
+
+        if (!allowed.has(action)) {
+          return res.status(400).json({
+            ok: false,
+            error: "عملية الخاص غير صالحة",
+            build: SERVER_BUILD,
+          });
+        }
+
+        const state = await readPrivateRelationshipState(playFabId);
+        const relation =
+          state.relations[peerId] || {
+            blockedByMeUnixMs: 0,
+            blockedMeUnixMs: 0,
+            deletedCutoffUnixMs: 0,
+          };
+
+        if (action === "block")
+          relation.blockedByMeUnixMs = value > 0 ? value : nowMs();
+        else if (action === "unblock")
+          relation.blockedByMeUnixMs = 0;
+        else if (action === "blocked_me")
+          relation.blockedMeUnixMs = value > 0 ? value : nowMs();
+        else if (action === "unblocked_me")
+          relation.blockedMeUnixMs = 0;
+        else if (action === "delete")
+          relation.deletedCutoffUnixMs = value > 0 ? value : nowMs();
+
+        if (relation.blockedByMeUnixMs > 0 ||
+            relation.blockedMeUnixMs > 0 ||
+            relation.deletedCutoffUnixMs > 0) {
+          state.relations[peerId] = relation;
+        } else {
+          delete state.relations[peerId];
+        }
+
+        const saved = await savePrivateRelationshipState(playFabId, state);
+        return res.json(privateRelationshipStateResponse(saved));
+      } catch (error) {
+        console.error("/chat/private-state/update", error);
+        return res.status(500).json({
+          ok: false,
+          error: "تعذر حفظ حالة الخاص",
+          build: SERVER_BUILD,
+        });
+      }
+    }
+  );
+
+  // ========================================================================
+  // PROFILE REFRESH - SERVER AUTHORITATIVE
+  // ========================================================================
+
+  app.post(
+    "/chat/profile-refresh",
+    async (req, res) => {
+      try {
+        const playFabId = await authenticateSessionTicket(
+          req.body && req.body.sessionTicket
+        );
+
+        touchPrivatePresence(playFabId);
+
+        // force=true: الاسم/الصورة بعد التغيير تأتي من PlayFab لا من Cache قديم.
+        const profile = await getPlayerProfile(playFabId, true);
+
+        return res.json(
+          sanitizeJsonForUnity({
+            ok: true,
+            playerName: safeString(profile && profile.playerName, 64) || "لاعب",
+            avatarUrl: safeString(profile && profile.avatarUrl, 1000),
+            avatarVersion: safeString(profile && profile.avatarVersion, 100) || "0",
+            build: SERVER_BUILD,
+          })
+        );
+      } catch (error) {
+        console.error("/chat/profile-refresh", error);
+        return res.status(500).json({
+          ok: false,
+          error: "تعذر تحديث ملف اللاعب",
+          build: SERVER_BUILD,
+        });
+      }
+    }
+  );
+
+  // ========================================================================
   // HISTORY
   // ========================================================================
 
@@ -13310,7 +13488,8 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         const window =
           buildHistoryResponseWindow(
             room,
-            limit
+            limit,
+            afterSeq
           );
 
         const hydratedMessages =
@@ -13330,13 +13509,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         const cursorLatestSeq =
           Math.max(
             afterSeq,
-
-            Math.max(
-              0,
-              Number(
-                room.seq
-              ) || 0
-            )
+            Math.max(0, Number(window.cursorSeq) || 0)
           );
 
         return res.json({
@@ -15253,7 +15426,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     "[LuxuryChat] installed",
     {
       version:
-        18,
+        21,
 
       build:
         SERVER_BUILD,
@@ -15344,6 +15517,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
       routes: [
         "/chat/private-inbox",
+        "/chat/private-state",
+        "/chat/private-state/update",
+        "/chat/profile-refresh",
         "/chat/messages",
         "/chat/send",
         "/chat/voice",
