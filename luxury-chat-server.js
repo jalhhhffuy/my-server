@@ -1,7 +1,7 @@
 "use strict";
 
 // ============================================================================
-// Luxury Chat Server - V19 PRIVATE PRESENCE / READ ZERO / 24H PERSISTENT INDEX
+// Luxury Chat Server - V25 SMART STYLE / TYPING / STRONG TEXT MODERATION
 // SERVER-AUTHORITATIVE PRIVATE INBOX + 24H CONVERSATION DELIVERY
 // Cloudinary-Authoritative Persistent 30 Days
 // Text + Voice + Image + Video + Reports + Avatar/Profile
@@ -9,7 +9,7 @@
 // Node 18+ / Express / multer / Cloudinary / PlayFab
 //
 // BUILD:
-// 2026-08-11-LUXURY-CHAT-SERVER-V18-PRIVATE-24H-AUTH-TRACE-PAIR-INDEX
+// 2026-08-13-LUXURY-CHAT-SERVER-V25-STRONG-OBFUSCATION-MODERATION
 //
 // server.js:
 // const installLuxuryChat = require("./luxury-chat-server");
@@ -97,7 +97,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-13-LUXURY-CHAT-SERVER-V23-MODERATION-WARN-BAN-READ-RECEIPT";
+    "2026-08-13-LUXURY-CHAT-SERVER-V25-STRONG-OBFUSCATION-MODERATION";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -439,6 +439,11 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
   // V19: Presence من السيرفر.
   const privatePresenceLastSeenUnixMs = new Map();
+
+  // V24: حالة الخاص المؤقتة (يقرأ/يكتب) داخل RAM فقط.
+  // لا تُكتب في Cloudinary ولا PlayFab، وتأتي/تعود ضمن نفس /chat/messages Poll.
+  const privateActivityByPlayer = new Map();
+  const PRIVATE_ACTIVITY_TIMEOUT_MS = 2200;
 
   const sendRate = new Map();
   const reportRate = new Map();
@@ -925,6 +930,22 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           b.length - a.length
       );
 
+  // V25: أقصى طول نحتاجه عند جمع أجزاء الكلمة المفصولة بمسافات/رموز.
+  // نسمح بفواصل طويلة جداً داخل الرسالة نفسها حتى لا يستطيع اللاعب
+  // تجاوز الفلتر بكتابة: ك     ل     ب أو ك @@@ ل ### ب.
+  const CHAT_BLOCKED_MAX_TERM_LENGTH =
+    CHAT_BLOCKED_TERMS.reduce(
+      (maximum, term) =>
+        Math.max(
+          maximum,
+          term.length
+        ),
+      0
+    );
+
+  const CHAT_MODERATION_MAX_FRAGMENT_PARTS = 18;
+  const CHAT_MODERATION_MAX_FRAGMENT_GAP = MAX_TEXT_LENGTH;
+
   function moderationTokenMatchesTerm(
     normalizedToken,
     term
@@ -1165,32 +1186,24 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       });
     }
 
+    // V25 - Fragment/obfuscation scan.
+    // لا نشترط أن يكون كل جزء حرفاً واحداً. لذلك نمسك أمثلة مثل:
+    // ك ل ب / كل ب / ك    ل    ب / ك-ل-ب / ك @@@ ل ### ب
+    // وكذلك التطويل والتشكيل لأن normalizeModerationText ينظفها.
+    // نعيد التطبيع بعد كل ضم حتى تنهار الحروف المكررة عبر أكثر من جزء.
     for (
       let i = 0;
       i < pieces.length;
       i++
     ) {
-      if (
-        pieces[i].normalized.length !== 1
-      ) {
-        continue;
-      }
-
       let joined = "";
-      let endIndex = i;
 
       for (
         let j = i;
         j < pieces.length &&
-        j < i + 12;
+        j < i + CHAT_MODERATION_MAX_FRAGMENT_PARTS;
         j++
       ) {
-        if (
-          pieces[j].normalized.length !== 1
-        ) {
-          break;
-        }
-
         if (j > i) {
           const gap =
             original.slice(
@@ -1198,32 +1211,62 @@ module.exports = function installLuxuryChat(app, cloudinary) {
               pieces[j].start
             );
 
+          // wordRegex فصل الحروف/الأرقام أصلاً، لذلك المفروض أن الفاصل
+          // يحتوي فقط على مسافات/رموز/إيموجي. هذا الشرط يمنع أي ضم غريب.
           if (
-            gap.length > 4 ||
-            /[\r\n]/u.test(gap)
+            gap.length >
+              CHAT_MODERATION_MAX_FRAGMENT_GAP ||
+            /[\p{L}\p{N}]/u.test(gap)
           ) {
             break;
           }
         }
 
-        joined +=
-          pieces[j].normalized;
-        endIndex = j;
+        joined =
+          normalizeModerationText(
+            joined +
+            pieces[j].normalized
+          );
+
+        if (!joined)
+          continue;
+
+        // moderationTokenMatchesTerm يسمح أيضاً بـ يا/ال وبعض اللواحق،
+        // لذلك نعطي هامشاً صغيراً فوق أطول كلمة ممنوعة.
+        if (
+          joined.length >
+          CHAT_BLOCKED_MAX_TERM_LENGTH + 4
+        ) {
+          break;
+        }
+
+        let blocked = false;
 
         for (
           const term
           of CHAT_BLOCKED_TERMS
         ) {
           if (
-            joined === term
+            moderationTokenMatchesTerm(
+              joined,
+              term
+            )
           ) {
-            ranges.push({
-              start:
-                pieces[i].start,
-              end:
-                pieces[endIndex].end,
-            });
+            blocked = true;
+            break;
           }
+        }
+
+        if (blocked) {
+          ranges.push({
+            start:
+              pieces[i].start,
+            end:
+              pieces[j].end,
+          });
+
+          // نأخذ أقصر Span حقق المطابقة حتى لا نخفي كلمات سليمة بعدها.
+          break;
         }
       }
     }
@@ -1929,6 +1972,62 @@ module.exports = function installLuxuryChat(app, cloudinary) {
     }
 
     return "";
+  }
+
+  function normalizePrivateActivity(value) {
+    const state = safeString(value, 20).trim().toLowerCase();
+    if (state === "typing") return "typing";
+    if (state === "reading") return "reading";
+    return "";
+  }
+
+  function updatePrivateActivityFromHistoryRequest(playFabId, roomId, rawState) {
+    const mine = canonicalPrivatePlayerId(playFabId);
+    const peerId = privatePeerFromRoom(roomId, playFabId);
+    const state = normalizePrivateActivity(rawState);
+
+    if (!mine || !peerId || !state) {
+      if (mine) privateActivityByPlayer.delete(mine);
+      return;
+    }
+
+    privateActivityByPlayer.set(mine, {
+      peerId,
+      state,
+      updatedAtUnixMs: nowMs(),
+    });
+  }
+
+  function privatePeerActivityForViewer(playFabId, roomId) {
+    const mine = canonicalPrivatePlayerId(playFabId);
+    const peerId = privatePeerFromRoom(roomId, playFabId);
+
+    if (!mine || !peerId) {
+      return {
+        peerActivity: "",
+        peerActivityPeerId: peerId || "",
+        peerActivityUpdatedUnixMs: 0,
+      };
+    }
+
+    const activity = privateActivityByPlayer.get(peerId);
+    const current = nowMs();
+
+    if (!activity ||
+        activity.peerId !== mine ||
+        current - Math.max(0, Number(activity.updatedAtUnixMs) || 0) > PRIVATE_ACTIVITY_TIMEOUT_MS) {
+      return {
+        peerActivity: "",
+        peerActivityPeerId: peerId,
+        peerActivityUpdatedUnixMs: 0,
+      };
+    }
+
+    return {
+      peerActivity: normalizePrivateActivity(activity.state),
+      peerActivityPeerId: peerId,
+      peerActivityUpdatedUnixMs: Math.max(0, Number(activity.updatedAtUnixMs) || 0),
+    };
   }
 
   function buildPrivateInboxRoomId(
@@ -14448,6 +14547,15 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             req.body.room
           );
 
+        // V24: لا طلب إضافي لحالة القراءة/الكتابة؛ نفس Poll يحدّث حالتنا.
+        if (isPrivateConversationRoom(roomId)) {
+          updatePrivateActivityFromHistoryRequest(
+            playFabId,
+            roomId,
+            req.body && req.body.privateActivity
+          );
+        }
+
         const afterSeq =
           Math.max(
             0,
@@ -14517,6 +14625,15 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             Math.max(0, Number(window.cursorSeq) || 0)
           );
 
+        const privateActivity =
+          isPrivateConversationRoom(roomId)
+            ? privatePeerActivityForViewer(playFabId, roomId)
+            : {
+                peerActivity: "",
+                peerActivityPeerId: "",
+                peerActivityUpdatedUnixMs: 0,
+              };
+
         return res.json({
           ok:
             true,
@@ -14537,6 +14654,15 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
           hasMore:
             window.hasMore,
+
+          peerActivity:
+            privateActivity.peerActivity,
+
+          peerActivityPeerId:
+            privateActivity.peerActivityPeerId,
+
+          peerActivityUpdatedUnixMs:
+            privateActivity.peerActivityUpdatedUnixMs,
 
           retentionDays:
             RETENTION_DAYS,
