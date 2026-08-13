@@ -97,7 +97,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // ========================================================================
 
   const SERVER_BUILD =
-    "2026-08-13-LUXURY-CHAT-SERVER-V21-INCREMENTAL-SERVER-RELATIONSHIPS";
+    "2026-08-13-LUXURY-CHAT-SERVER-V23-MODERATION-WARN-BAN-READ-RECEIPT";
 
   const TITLE_ID = String(process.env.PLAYFAB_TITLE_ID || "").trim();
   const SECRET_KEY = String(process.env.PLAYFAB_SECRET_KEY || "").trim();
@@ -115,6 +115,85 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   // نفس Tokens الموجودة في LuxuryPrivateChatManager الحالي.
   const PRIVATE_INBOX_EVENT_TOKEN = "__LPI1__";
   const PRIVATE_INBOX_READ_TOKEN = "__LPIR1__";
+
+  // Server-authoritative text moderation.
+  // الكلمات الإضافية يمكن وضعها في CHAT_BAD_WORDS مفصولة بفواصل بدون تعديل Unity.
+  const CHAT_MODERATION_STATE_KEY =
+    "LUXURY_CHAT_MODERATION_STATE_V1";
+  const CHAT_MODERATION_MAX_WARNINGS = 3;
+  const CHAT_MODERATION_BAN_MS =
+    24 * 60 * 60 * 1000;
+  const CHAT_MODERATION_CACHE_MS =
+    15 * 1000;
+  const CHAT_MODERATION_NOTICE_SECONDS = 8;
+  const PRIVATE_CONTROL_EVENT_TOKEN = "__LPCS1__";
+
+  const DEFAULT_CHAT_BLOCKED_TERMS = [
+    "قحبه",
+    "قحبة",
+    "شرموط",
+    "شرموطه",
+    "شرموطة",
+    "منيوك",
+    "منيوكه",
+    "منيوكة",
+    "نيك",
+    "كس",
+    "زب",
+    "طيز",
+    "خول",
+    "خنيث",
+    "لوطي",
+    "عاهر",
+    "عاهره",
+    "عاهرة",
+    "زق",
+    "كلب",
+    "حمار",
+    "وسخ",
+    "وسخه",
+    "وسخة",
+    "حقير",
+    "حقيره",
+    "حقيرة",
+    "غبي",
+    "غبيه",
+    "غبية",
+    "اهبل",
+    "هبيل",
+    "حيوان",
+    "معفن",
+    "معفنه",
+    "معفنة",
+    "قذر",
+    "قذره",
+    "قذرة",
+    "ديوث",
+    "عرص",
+    "متناك",
+    "متناكه",
+    "متناكة",
+    "زاني",
+    "زانيه",
+    "زانية",
+    "مهبل",
+    "قضيب",
+    "سكس",
+    "بورنو",
+    "اباحي",
+    "اباحيه",
+    "اباحية",
+    "fuck",
+    "shit",
+    "bitch",
+    "dick",
+    "pussy",
+    "porn",
+    "sex",
+    "kos",
+    "zob",
+  ];
+
 
   const PRIVATE_INBOX_ACTIVE_HOURS = 24;
   const MAX_PRIVATE_INBOX_CONVERSATIONS = 2000;
@@ -783,6 +862,723 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       text,
       MAX_TEXT_LENGTH
     );
+  }
+
+
+  // ========================================================================
+  // TEXT MODERATION - CENSOR + 3 WARNINGS => 24H CHAT BAN
+  // ========================================================================
+
+  const chatModerationStateCache = new Map();
+
+  function normalizeModerationText(value) {
+    let text =
+      sanitizeUnicodeString(
+        value
+      );
+
+    try {
+      text =
+        text.normalize(
+          "NFKC"
+        );
+    } catch (_) {}
+
+    return text
+      .toLowerCase()
+      .replace(
+        /[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]/gu,
+        ""
+      )
+      .replace(/[أإآٱ]/gu, "ا")
+      .replace(/[ىئ]/gu, "ي")
+      .replace(/ؤ/gu, "و")
+      .replace(/ة/gu, "ه")
+      .replace(/3/gu, "ع")
+      .replace(/7/gu, "ح")
+      .replace(/5/gu, "خ")
+      .replace(/6/gu, "ط")
+      .replace(/9/gu, "ص")
+      .replace(/8/gu, "ق")
+      .replace(/([\u0621-\u064A])\1{1,}/gu, "$1")
+      .replace(/[^\p{L}\p{N}]+/gu, "");
+  }
+
+  const CHAT_BLOCKED_TERMS =
+    Array.from(
+      new Set(
+        DEFAULT_CHAT_BLOCKED_TERMS
+          .concat(
+            String(
+              process.env.CHAT_BAD_WORDS || ""
+            )
+              .split(",")
+              .map((item) => item.trim())
+              .filter(Boolean)
+          )
+          .map(normalizeModerationText)
+          .filter((item) => item.length >= 2)
+      )
+    )
+      .sort(
+        (a, b) =>
+          b.length - a.length
+      );
+
+  function moderationTokenMatchesTerm(
+    normalizedToken,
+    term
+  ) {
+    if (
+      !normalizedToken ||
+      !term
+    ) {
+      return false;
+    }
+
+    if (
+      normalizedToken === term
+    ) {
+      return true;
+    }
+
+    let token =
+      normalizedToken;
+
+    if (
+      token.startsWith("يا") &&
+      token.length >
+        term.length
+    ) {
+      token =
+        token.slice(2);
+
+      if (
+        token === term
+      ) {
+        return true;
+      }
+    }
+
+    if (
+      token.startsWith("ال") &&
+      token.length >
+        term.length
+    ) {
+      const withoutArticle =
+        token.slice(2);
+
+      if (
+        withoutArticle === term
+      ) {
+        return true;
+      }
+
+      token =
+        withoutArticle;
+    }
+
+    const suffixes = [
+      "ك",
+      "كم",
+      "كن",
+      "ه",
+      "ها",
+      "هم",
+      "هن",
+      "ي",
+      "نا",
+    ];
+
+    for (
+      const suffix
+      of suffixes
+    ) {
+      if (
+        token ===
+          term + suffix
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function mergeModerationRanges(
+    ranges
+  ) {
+    if (
+      !Array.isArray(ranges) ||
+      ranges.length === 0
+    ) {
+      return [];
+    }
+
+    const sorted =
+      ranges
+        .filter(
+          (item) =>
+            item &&
+            Number.isFinite(item.start) &&
+            Number.isFinite(item.end) &&
+            item.end > item.start
+        )
+        .sort(
+          (a, b) =>
+            a.start - b.start ||
+            a.end - b.end
+        );
+
+    const merged = [];
+
+    for (
+      const range
+      of sorted
+    ) {
+      const last =
+        merged.length > 0
+          ? merged[
+              merged.length - 1
+            ]
+          : null;
+
+      if (
+        !last ||
+        range.start >
+          last.end
+      ) {
+        merged.push({
+          start:
+            range.start,
+          end:
+            range.end,
+        });
+      } else {
+        last.end =
+          Math.max(
+            last.end,
+            range.end
+          );
+      }
+    }
+
+    return merged;
+  }
+
+  function censorChatText(
+    rawText
+  ) {
+    const original =
+      cleanText(
+        rawText
+      );
+
+    if (!original) {
+      return {
+        text: "",
+        moderated: false,
+        matches: 0,
+      };
+    }
+
+    const ranges = [];
+    const chunkRegex =
+      /\S+/gu;
+
+    let match;
+
+    while (
+      (
+        match =
+          chunkRegex.exec(
+            original
+          )
+      ) !== null
+    ) {
+      const chunk =
+        match[0] || "";
+
+      const normalized =
+        normalizeModerationText(
+          chunk
+        );
+
+      if (!normalized)
+        continue;
+
+      let blocked =
+        false;
+
+      for (
+        const term
+        of CHAT_BLOCKED_TERMS
+      ) {
+        if (
+          moderationTokenMatchesTerm(
+            normalized,
+            term
+          )
+        ) {
+          blocked =
+            true;
+          break;
+        }
+      }
+
+      if (blocked) {
+        ranges.push({
+          start:
+            match.index,
+          end:
+            match.index +
+            chunk.length,
+        });
+      }
+    }
+
+    const wordRegex =
+      /[\p{L}\p{N}]+/gu;
+
+    const pieces = [];
+
+    while (
+      (
+        match =
+          wordRegex.exec(
+            original
+          )
+      ) !== null
+    ) {
+      const normalized =
+        normalizeModerationText(
+          match[0]
+        );
+
+      pieces.push({
+        start:
+          match.index,
+        end:
+          match.index +
+          match[0].length,
+        normalized,
+      });
+    }
+
+    for (
+      let i = 0;
+      i < pieces.length;
+      i++
+    ) {
+      if (
+        pieces[i].normalized.length !== 1
+      ) {
+        continue;
+      }
+
+      let joined = "";
+      let endIndex = i;
+
+      for (
+        let j = i;
+        j < pieces.length &&
+        j < i + 12;
+        j++
+      ) {
+        if (
+          pieces[j].normalized.length !== 1
+        ) {
+          break;
+        }
+
+        if (j > i) {
+          const gap =
+            original.slice(
+              pieces[j - 1].end,
+              pieces[j].start
+            );
+
+          if (
+            gap.length > 4 ||
+            /[\r\n]/u.test(gap)
+          ) {
+            break;
+          }
+        }
+
+        joined +=
+          pieces[j].normalized;
+        endIndex = j;
+
+        for (
+          const term
+          of CHAT_BLOCKED_TERMS
+        ) {
+          if (
+            joined === term
+          ) {
+            ranges.push({
+              start:
+                pieces[i].start,
+              end:
+                pieces[endIndex].end,
+            });
+          }
+        }
+      }
+    }
+
+    const merged =
+      mergeModerationRanges(
+        ranges
+      );
+
+    if (
+      merged.length === 0
+    ) {
+      return {
+        text:
+          original,
+        moderated:
+          false,
+        matches:
+          0,
+      };
+    }
+
+    let output = "";
+    let cursor = 0;
+
+    for (
+      const range
+      of merged
+    ) {
+      output +=
+        original.slice(
+          cursor,
+          range.start
+        );
+
+      output +=
+        "****";
+
+      cursor =
+        range.end;
+    }
+
+    output +=
+      original.slice(
+        cursor
+      );
+
+    return {
+      text:
+        cleanText(
+          output
+        ),
+      moderated:
+        true,
+      matches:
+        merged.length,
+    };
+  }
+
+  function normalizeChatModerationState(
+    raw
+  ) {
+    return {
+      version: 1,
+      warningCount:
+        Math.max(
+          0,
+          Math.min(
+            CHAT_MODERATION_MAX_WARNINGS - 1,
+            Number(
+              raw &&
+              raw.warningCount
+            ) || 0
+          )
+        ),
+      banUntilUnixMs:
+        Math.max(
+          0,
+          Number(
+            raw &&
+            raw.banUntilUnixMs
+          ) || 0
+        ),
+      updatedUnixMs:
+        Math.max(
+          0,
+          Number(
+            raw &&
+            raw.updatedUnixMs
+          ) || 0
+        ),
+    };
+  }
+
+  async function readChatModerationState(
+    playFabId,
+    force
+  ) {
+    const id =
+      safeString(
+        playFabId,
+        100
+      );
+
+    const cached =
+      chatModerationStateCache.get(
+        id
+      );
+
+    const now =
+      nowMs();
+
+    if (
+      !force &&
+      cached &&
+      now -
+        cached.cachedUnixMs <
+        CHAT_MODERATION_CACHE_MS
+    ) {
+      return {
+        ...cached.state,
+      };
+    }
+
+    const data =
+      await playFabServerCall(
+        "GetUserData",
+        {
+          PlayFabId:
+            id,
+          Keys: [
+            CHAT_MODERATION_STATE_KEY,
+          ],
+        }
+      );
+
+    const record =
+      data &&
+      data.Data
+        ? data.Data[
+            CHAT_MODERATION_STATE_KEY
+          ]
+        : null;
+
+    let parsed = null;
+
+    if (
+      record &&
+      record.Value
+    ) {
+      try {
+        parsed =
+          JSON.parse(
+            String(
+              record.Value
+            )
+          );
+      } catch (_) {}
+    }
+
+    let state =
+      normalizeChatModerationState(
+        parsed
+      );
+
+    if (
+      state.banUntilUnixMs > 0 &&
+      state.banUntilUnixMs <= now
+    ) {
+      state.banUntilUnixMs = 0;
+      state.warningCount = 0;
+    }
+
+    chatModerationStateCache.set(
+      id,
+      {
+        state: {
+          ...state,
+        },
+        cachedUnixMs:
+          now,
+      }
+    );
+
+    return state;
+  }
+
+  async function saveChatModerationState(
+    playFabId,
+    state
+  ) {
+    const id =
+      safeString(
+        playFabId,
+        100
+      );
+
+    const normalized =
+      normalizeChatModerationState(
+        state
+      );
+
+    normalized.updatedUnixMs =
+      nowMs();
+
+    await playFabServerCall(
+      "UpdateUserData",
+      {
+        PlayFabId:
+          id,
+        Data: {
+          [CHAT_MODERATION_STATE_KEY]:
+            safeJsonStringify(
+              normalized
+            ),
+        },
+        Permission:
+          "Private",
+      }
+    );
+
+    chatModerationStateCache.set(
+      id,
+      {
+        state: {
+          ...normalized,
+        },
+        cachedUnixMs:
+          nowMs(),
+      }
+    );
+
+    return normalized;
+  }
+
+  function formatChatBanRemaining(
+    banUntilUnixMs
+  ) {
+    const remaining =
+      Math.max(
+        0,
+        Number(
+          banUntilUnixMs
+        ) -
+        nowMs()
+      );
+
+    const totalMinutes =
+      Math.max(
+        1,
+        Math.ceil(
+          remaining /
+          60000
+        )
+      );
+
+    const hours =
+      Math.floor(
+        totalMinutes /
+        60
+      );
+
+    const minutes =
+      totalMinutes %
+      60;
+
+    if (
+      hours > 0 &&
+      minutes > 0
+    ) {
+      return `${hours} س و ${minutes} د`;
+    }
+
+    if (hours > 0)
+      return `${hours} ساعة`;
+
+    return `${minutes} دقيقة`;
+  }
+
+  function buildModerationNotice(
+    warningNumber,
+    playerName
+  ) {
+    const name =
+      safeString(
+        playerName,
+        64
+      ) ||
+      "اللاعب";
+
+    if (
+      warningNumber === 1
+    ) {
+      return `إنذار أول للاعب ${name} بسبب استخدام ألفاظ مسيئة أو جنسية أو غير لائقة.`;
+    }
+
+    if (
+      warningNumber === 2
+    ) {
+      return `إنذار ثانٍ للاعب ${name} بسبب تكرار استخدام ألفاظ مسيئة أو جنسية أو غير لائقة.`;
+    }
+
+    return `تم حظر اللاعب ${name} من الشات لمدة 24 ساعة بسبب تكرار المخالفات.`;
+  }
+
+  async function registerChatModerationViolation(
+    playFabId,
+    playerName,
+    currentState
+  ) {
+    const previous =
+      normalizeChatModerationState(
+        currentState
+      );
+
+    const warningNumber =
+      Math.min(
+        CHAT_MODERATION_MAX_WARNINGS,
+        previous.warningCount + 1
+      );
+
+    const next = {
+      ...previous,
+      warningCount:
+        warningNumber,
+      banUntilUnixMs:
+        0,
+    };
+
+    if (
+      warningNumber >=
+      CHAT_MODERATION_MAX_WARNINGS
+    ) {
+      next.warningCount = 0;
+      next.banUntilUnixMs =
+        nowMs() +
+        CHAT_MODERATION_BAN_MS;
+    }
+
+    const saved =
+      await saveChatModerationState(
+        playFabId,
+        next
+      );
+
+    return {
+      warningNumber,
+      banUntilUnixMs:
+        saved.banUntilUnixMs,
+      notice:
+        buildModerationNotice(
+          warningNumber,
+          playerName
+        ),
+    };
   }
 
   function cleanReason(value) {
@@ -3118,6 +3914,48 @@ module.exports = function installLuxuryChat(app, cloudinary) {
   }
 
 
+  // لا نجعل تحديث قائمة الخاص يحبس رد إرسال الرسالة.
+  // تاريخ الرسالة يُحفظ أولاً رسمياً، ثم تحديث Inbox يتم كعمل سيرفر ثانوي idempotent.
+  function queuePrivateInboxMirror(
+    roomId,
+    sourceMessage
+  ) {
+    if (
+      !sourceMessage ||
+      !sourceMessage.id ||
+      !isPrivateConversationRoom(roomId)
+    ) {
+      return {
+        queued: false,
+        reason: "not_private_message",
+      };
+    }
+
+    setImmediate(() => {
+      ensurePrivateInboxForMessageSafe(
+        roomId,
+        sourceMessage
+      ).catch((error) => {
+        console.warn(
+          "[LuxuryChat][PRIVATE_INBOX][ASYNC_MIRROR_FAILED]",
+          {
+            room: cleanRoom(roomId),
+            messageId: safeString(sourceMessage.id, 100),
+            error:
+              error && error.message
+                ? sanitizeUnicodeString(error.message)
+                : error,
+          }
+        );
+      });
+    });
+
+    return {
+      queued: true,
+    };
+  }
+
+
   // ========================================================================
   // PRIVATE INBOX V16 - SELF HEAL FROM REAL PRIVATE HISTORY
   // ========================================================================
@@ -5397,6 +6235,31 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         safeString(
           raw.replyToPreview,
           120
+        ),
+
+      moderationWarningNumber:
+        Math.max(
+          0,
+          Math.min(
+            CHAT_MODERATION_MAX_WARNINGS,
+            Number(
+              raw.moderationWarningNumber
+            ) || 0
+          )
+        ),
+
+      moderationNoticeText:
+        safeString(
+          raw.moderationNoticeText,
+          260
+        ),
+
+      moderationBanUntilUnixMs:
+        Math.max(
+          0,
+          Number(
+            raw.moderationBanUntilUnixMs
+          ) || 0
         ),
     };
   }
@@ -7910,7 +8773,8 @@ module.exports = function installLuxuryChat(app, cloudinary) {
 
   async function pushMessage(
     roomId,
-    message
+    message,
+    options = {}
   ) {
     return enqueueRoomMutation(
       roomId,
@@ -7920,7 +8784,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             roomId,
             {
               forceStorageRefresh:
-                true,
+                options.forceStorageRefresh !== false,
             }
           );
 
@@ -11247,6 +12111,15 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           reply.replyToPreview,
           120
         ),
+
+      moderationWarningNumber:
+        0,
+
+      moderationNoticeText:
+        "",
+
+      moderationBanUntilUnixMs:
+        0,
     };
   }
 
@@ -13080,6 +13953,44 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             ) || 0
           );
 
+        let readThroughUnixMs = 0;
+
+        for (
+          const inboxMessage
+          of (
+            Array.isArray(
+              room &&
+              room.messages
+            )
+              ? room.messages
+              : []
+          )
+        ) {
+          const event =
+            parsePrivateInboxEventText(
+              inboxMessage &&
+              inboxMessage.text
+            );
+
+          if (
+            !event ||
+            event.mineEvent ||
+            canonicalPrivatePlayerId(
+              event.peerId
+            ) !== peerId
+          ) {
+            continue;
+          }
+
+          readThroughUnixMs =
+            Math.max(
+              readThroughUnixMs,
+              Number(
+                inboxMessage.sentUnixMs
+              ) || 0
+            );
+        }
+
         if (
           inboxRoom &&
           upToSeq > 0
@@ -13123,6 +14034,100 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             inboxRoom,
             readMessage
           );
+        }
+
+        if (
+          readThroughUnixMs > 0
+        ) {
+          const peerInboxRoom =
+            buildPrivateInboxRoomId(
+              peerId
+            );
+
+          if (peerInboxRoom) {
+            try {
+              const ownerProfile =
+                await getPlayerProfile(
+                  ownerId,
+                  false
+                );
+
+              const receiptNow =
+                nowMs();
+
+              const receipt =
+                makeMessage({
+                  roomId:
+                    peerInboxRoom,
+                  senderId:
+                    ownerId,
+                  profile:
+                    ownerProfile,
+                  kind:
+                    "text",
+                  reply:
+                    null,
+                  clientMessageId:
+                    `lpcr_srv_${stablePrivateInboxToken(
+                      `${ownerId}|${peerId}|${readThroughUnixMs}`
+                    )}`,
+                });
+
+              receipt.sentUnixMs =
+                receiptNow;
+
+              receipt.text =
+                [
+                  PRIVATE_CONTROL_EVENT_TOKEN,
+                  "read_exit",
+                  String(
+                    receiptNow
+                  ),
+                  String(
+                    readThroughUnixMs
+                  ),
+                ].join("|");
+
+              setImmediate(() => {
+                pushPrivateInboxEventWithRetry(
+                  peerInboxRoom,
+                  receipt
+                ).catch((error) => {
+                  console.warn(
+                    "[LuxuryChat][PRIVATE_READ_RECEIPT][MIRROR_FAILED]",
+                    {
+                      ownerId,
+                      peerId,
+                      readThroughUnixMs,
+                      error:
+                        error &&
+                        error.message
+                          ? sanitizeUnicodeString(
+                              error.message
+                            )
+                          : error,
+                    }
+                  );
+                });
+              });
+            } catch (error) {
+              console.warn(
+                "[LuxuryChat][PRIVATE_READ_RECEIPT][BUILD_FAILED]",
+                {
+                  ownerId,
+                  peerId,
+                  readThroughUnixMs,
+                  error:
+                    error &&
+                    error.message
+                      ? sanitizeUnicodeString(
+                          error.message
+                        )
+                      : error,
+                }
+              );
+            }
+          }
         }
 
         privateConversationIndexCache.delete(
@@ -13588,11 +14593,14 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             req.body.room
           );
 
-        const text =
-          cleanText(
+        const moderationResult =
+          censorChatText(
             req.body &&
             req.body.text
           );
+
+        const text =
+          moderationResult.text;
 
         if (!text) {
           return res
@@ -13606,10 +14614,31 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             });
         }
 
+        // نبدأ فحص العقوبة بالتوازي مع تجهيز الغرفة حتى لا نبطئ الإرسال.
+        // لا نطبقه قبل duplicate lookup لأن Retry لرسالة الإنذار الثالث
+        // يجب أن يعيد نفس الرسالة المحفوظة حتى لو بدأ الحظر بعدها.
+        const moderationStatePromise =
+          readChatModerationState(
+            playFabId,
+            false
+          );
+
         const clientMessageId =
           cleanClientMessageId(
             req.body &&
             req.body.clientMessageId
+          );
+
+        const sendAttempt =
+          Math.max(
+            1,
+            Math.min(
+              3,
+              Number(
+                req.body &&
+                req.body.sendAttempt
+              ) || 1
+            )
           );
 
         const room =
@@ -13617,7 +14646,7 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             roomId,
             {
               forceStorageRefresh:
-                true,
+                sendAttempt > 1,
             }
           );
 
@@ -13630,10 +14659,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             );
 
           if (duplicate) {
-            // إذا كانت الرسالة الأصلية موجودة لكن Inbox فشل سابقاً،
-            // Retry لن يكرر الرسالة؛ فقط يعيد ضمان Inbox للطرفين.
+            // Retry لن يكرر الرسالة. تحديث Inbox لا يحبس رد الإرسال.
             const privateInboxMirror =
-              await ensurePrivateInboxForMessageSafe(
+              queuePrivateInboxMirror(
                 roomId,
                 duplicate
               );
@@ -13658,6 +14686,53 @@ module.exports = function installLuxuryChat(app, cloudinary) {
           }
         }
 
+        let moderationState =
+          await moderationStatePromise;
+
+        const privateSystemPayload =
+          isPrivateInboxRoom(
+            roomId
+          ) &&
+          (
+            text.startsWith(
+              PRIVATE_CONTROL_EVENT_TOKEN + "|"
+            ) ||
+            text.startsWith(
+              PRIVATE_INBOX_EVENT_TOKEN + "|"
+            ) ||
+            text.startsWith(
+              PRIVATE_INBOX_READ_TOKEN + "|"
+            )
+          );
+
+        if (
+          !privateSystemPayload &&
+          moderationState.banUntilUnixMs >
+          nowMs()
+        ) {
+          return res
+            .status(403)
+            .json({
+              ok:
+                false,
+
+              error:
+                "أنت محظور من إرسال رسائل الشات مؤقتاً. المتبقي: " +
+                formatChatBanRemaining(
+                  moderationState.banUntilUnixMs
+                ),
+
+              chatBanned:
+                true,
+
+              banUntilUnixMs:
+                moderationState.banUntilUnixMs,
+
+              build:
+                SERVER_BUILD,
+            });
+        }
+
         if (
           !checkRate(
             sendRate,
@@ -13676,18 +14751,44 @@ module.exports = function installLuxuryChat(app, cloudinary) {
             });
         }
 
-        const profile =
-          await getPlayerProfile(
+        // الاسم/الصورة من Cache السيرفر القصير (15ث).
+        // /chat/profile-refresh يحدث هذا Cache فور نجاح تغيير الاسم أو الصورة.
+        // نجلب البروفايل والرد بالتوازي بدل انتظار أحدهما بعد الآخر.
+        const [
+          profile,
+          reply,
+        ] = await Promise.all([
+          getPlayerProfile(
             playFabId,
-            true
-          );
-
-        const reply =
-          await replySnapshot(
+            false
+          ),
+          replySnapshot(
             roomId,
             req.body &&
             req.body.replyToMessageId
-          );
+          ),
+        ]);
+
+        let moderationAction =
+          null;
+
+        if (
+          moderationResult.moderated
+        ) {
+          moderationAction =
+            await registerChatModerationViolation(
+              playFabId,
+              profile &&
+              profile.playerName,
+              moderationState
+            );
+
+          moderationState =
+            await readChatModerationState(
+              playFabId,
+              false
+            );
+        }
 
         let message =
           makeMessage({
@@ -13709,15 +14810,30 @@ module.exports = function installLuxuryChat(app, cloudinary) {
         message.text =
           text;
 
+        if (moderationAction) {
+          message.moderationWarningNumber =
+            moderationAction.warningNumber;
+
+          message.moderationNoticeText =
+            moderationAction.notice;
+
+          message.moderationBanUntilUnixMs =
+            moderationAction.banUntilUnixMs;
+        }
+
         message =
           await pushMessage(
             roomId,
-            message
+            message,
+            {
+              // الغرفة تم تجهيزها أعلاه؛ لا نعيد Cloudinary refresh مرة ثانية لنفس الإرسال.
+              forceStorageRefresh: false,
+            }
           );
 
-        // المصدر الرسمي لقائمة الخاص الآن هو السيرفر نفسه.
+        // الرسالة أصبحت محفوظة رسمياً. لا نحبس رد اللاعب بكتابة Inbox الثانوية.
         const privateInboxMirror =
-          await ensurePrivateInboxForMessageSafe(
+          queuePrivateInboxMirror(
             roomId,
             message
           );
@@ -13859,6 +14975,33 @@ module.exports = function installLuxuryChat(app, cloudinary) {
                 ),
             });
           }
+        }
+
+        const voiceModerationState =
+          await readChatModerationState(
+            playFabId,
+            false
+          );
+
+        if (
+          voiceModerationState.banUntilUnixMs >
+          nowMs()
+        ) {
+          return res
+            .status(403)
+            .json({
+              ok: false,
+              chatBanned: true,
+              banUntilUnixMs:
+                voiceModerationState.banUntilUnixMs,
+              error:
+                "أنت محظور من الشات مؤقتاً. المتبقي: " +
+                formatChatBanRemaining(
+                  voiceModerationState.banUntilUnixMs
+                ),
+              build:
+                SERVER_BUILD,
+            });
         }
 
         if (
@@ -14459,6 +15602,33 @@ module.exports = function installLuxuryChat(app, cloudinary) {
                 ),
             });
           }
+        }
+
+        const mediaModerationState =
+          await readChatModerationState(
+            playFabId,
+            false
+          );
+
+        if (
+          mediaModerationState.banUntilUnixMs >
+          nowMs()
+        ) {
+          return res
+            .status(403)
+            .json({
+              ok: false,
+              chatBanned: true,
+              banUntilUnixMs:
+                mediaModerationState.banUntilUnixMs,
+              error:
+                "أنت محظور من الشات مؤقتاً. المتبقي: " +
+                formatChatBanRemaining(
+                  mediaModerationState.banUntilUnixMs
+                ),
+              build:
+                SERVER_BUILD,
+            });
         }
 
         if (
