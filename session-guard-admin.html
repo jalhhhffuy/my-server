@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>إدارة حظر الحسابات | Red Revenge</title>
+<style>
+:root{color-scheme:dark;font-family:Tahoma,Arial,sans-serif;background:#07111d;color:#eef3fa}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}main{width:min(100%,580px);padding:32px;border:1px solid #94733b;border-radius:20px;background:linear-gradient(145deg,#15263b,#0c1828);box-shadow:0 24px 80px #0008}h1{font-size:26px;margin:10px 0 16px;color:#f0d39a}p{line-height:1.8;color:#bdcada}.brand{font-size:12px;letter-spacing:3px;color:#d5b26a}label{display:block;margin:20px 0 8px;font-size:14px}input{width:100%;padding:14px;border:1px solid #486077;border-radius:10px;background:#071320;color:#fff;font-size:16px;direction:ltr;text-align:left}input:focus{outline:2px solid #d6b477;outline-offset:2px}button{width:100%;padding:15px;border:0;border-radius:10px;cursor:pointer;font-size:16px;font-weight:bold;margin-top:18px;background:#d8b575;color:#152132}button:disabled{opacity:.45;cursor:not-allowed}#unban{background:#bfe2d4}#state{margin-top:24px;padding:18px;border:1px solid #486077;border-radius:10px;line-height:1.9;white-space:pre-line;overflow-wrap:anywhere}#message{min-height:27px;color:#f2cd87;font-size:14px}.small{font-size:12px;color:#9fadc0}#logout{background:transparent;border:1px solid #486077;color:#cad5e4;font-weight:normal}
+</style></head>
+<body><main><div class="brand" dir="ltr">RED REVENGE / ADMIN</div><h1>إدارة حظر الحسابات</h1><p>اعرض حالة الحساب، ثم فك حظره. يبقى سجل المخالفات محفوظًا.</p>
+<label for="key">مفتاح الإدارة الخاص</label><input id="key" type="password" autocomplete="off" spellcheck="false" maxlength="128" placeholder="مفتاح الإدارة المحفوظ في السيرفر">
+<label for="account">معرّف الحساب PlayFab ID</label><input id="account" autocomplete="off" spellcheck="false" maxlength="40" placeholder="مثال: A1B2C3D4E5F60708">
+<button id="lookup" type="button">عرض حالة الحساب</button><div id="state" role="status" aria-live="polite" hidden></div>
+<button id="unban" type="button" disabled hidden>فك حظر الحساب</button><p id="message" role="status" aria-live="polite"></p>
+<button id="logout" type="button">مسح مفتاح الإدارة من الصفحة</button><p class="small">معرّف الحساب من PlayFab وليس اسم اللاعب أو رقمه العام. هذه الصفحة لا تحفظ مفتاح الإدارة في المتصفح.</p>
+</main><script src="/admin/session-guard.js" defer></script></body></html>
