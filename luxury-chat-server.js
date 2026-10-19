@@ -5680,6 +5680,9 @@ module.exports = function installLuxuryChat(app, cloudinary) {
       );
     }
 
+    // Chat/media/private messages must also reject revoked sessions.
+    if (!app.locals.gameSessionGuard) throw makeChatError("SESSION_GUARD_UNAVAILABLE", "تعذر التحقق من الجلسة");
+    await app.locals.gameSessionGuard.assertTicket(playFabId, ticket);
     return playFabId;
   }
 
