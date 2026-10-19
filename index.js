@@ -308,6 +308,10 @@ async function deleteCloudinaryImage(publicId) {
 // IMPORTANT: rawBody middleware above must stay BEFORE this installation.
 // ============================================================================
 
+// Session coordinator is installed before protected chat/account routes.
+const gameSessionGuard = require("./game-session-guard")(
+  app, ticket => authenticatePlayFabSession(ticket, true));
+
 const installLuxuryChat = require("./luxury-chat-server");
 installLuxuryChat(app, cloudinary);
 
@@ -411,7 +415,7 @@ function isPlayFabSuccess(result) {
   return !!(result && result.code === 200 && result.data !== undefined);
 }
 
-async function authenticatePlayFabSession(sessionTicket) {
+async function authenticatePlayFabSession(sessionTicket, sessionBootstrapOnly = false) {
   const ticket = String(sessionTicket || "").trim();
 
   if (!ticket) {
@@ -437,10 +441,15 @@ async function authenticatePlayFabSession(sessionTicket) {
     };
   }
 
-  return {
-    success: true,
-    playFabId: String(result.data.UserInfo.PlayFabId),
-  };
+  const playFabId = String(result.data.UserInfo.PlayFabId);
+  if (!sessionBootstrapOnly) {
+    try { await gameSessionGuard.assertTicket(playFabId, ticket); }
+    catch (error) {
+      return {success:false, code:error.code || "SESSION_GUARD_UNAVAILABLE",
+        message:error.sessionState ? error.sessionState.message : "تعذر التحقق من أمان الجلسة"};
+    }
+  }
+  return {success:true,playFabId};
 }
 
 async function getTitleInternalValue(key) {
@@ -1629,5 +1638,4 @@ app.listen(PORT, () => {
     secureGoogleLinkStartRoute: "/auth/google/link/start",
   });
 });
-
 
