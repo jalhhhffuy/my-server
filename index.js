@@ -308,6 +308,9 @@ async function deleteCloudinaryImage(publicId) {
 // IMPORTANT: rawBody middleware above must stay BEFORE this installation.
 // ============================================================================
 
+// Server-only storage bridge; existing Unity session routes remain unchanged.
+require("./game-store-bridge")(app);
+
 // Session coordinator is installed before protected chat/account routes.
 const gameSessionGuard = require("./game-session-guard")(
   app, ticket => authenticatePlayFabSession(ticket, true));
