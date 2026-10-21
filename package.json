@@ -3,13 +3,21 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test/cloudscript-checks.js && node --test test/*.test.js",
+    "store:export": "node scripts/export-upstash.js",
+    "store:import": "node scripts/import-store.js",
+    "store:check": "node scripts/check-store.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "nodemailer": "^6.9.16",
     "bcryptjs": "^2.4.3",
     "multer": "^2.0.2",
-    "cloudinary": "^2.7.0"
+    "cloudinary": "^2.7.0",
+    "redis": "5.9.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
